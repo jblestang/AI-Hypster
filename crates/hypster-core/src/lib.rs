@@ -125,6 +125,15 @@ impl Hypervisor {
     /// Common Criteria EAL5+ TSF Operational Verification:
     /// Enforces non-interference invariants, memory range validation, and register safety.
     pub fn new(vm1_mem: &mut [u8], vm2_mem: &mut [u8]) -> Self {
+        Self::new_inner(vm1_mem, vm2_mem, false)
+    }
+
+    /// Legacy packet-forwarding path: host-side VirtualE1000 RX init for [`Hypervisor::run`].
+    pub fn new_legacy(vm1_mem: &mut [u8], vm2_mem: &mut [u8]) -> Self {
+        Self::new_inner(vm1_mem, vm2_mem, true)
+    }
+
+    fn new_inner(vm1_mem: &mut [u8], vm2_mem: &mut [u8], legacy_e1000_host: bool) -> Self {
         serial_print("\n========================================================\n");
         serial_print("[HYPSTER] Initializing Static Partitioning Hypervisor\n");
         serial_print("========================================================\n");
@@ -134,7 +143,7 @@ impl Hypervisor {
 
         let pci_devs = pci::PciBusScanner::scan_all_e1000();
         let hw_bar0 = pci_devs[0].map(|d| d.bar0).unwrap_or(0);
-        if hw_bar0 != 0 && hw_bar0 != 0x20000000 {
+        if legacy_e1000_host && hw_bar0 != 0 && hw_bar0 != 0x20000000 {
         // Verify security policy condition bounds
             e1000_emu::init_hardware_e1000_rx(hw_bar0);
         }

@@ -9,6 +9,9 @@ const HYPERCALL_GUEST_SHUTDOWN: u64 = 0x201;
 
 const SHARED_IPC_GPA: u64 = 0xFE000000;
 
+/// VM2 EPT MMIO passthrough: BAR0 GPA `0x2000_0000` + e1000 REG_TDT offset `0x318`.
+const E1000_TDT_GPA: u64 = 0x2000_0318;
+
 const MAX_PACKET_LEN: usize = 1518;
 const CHANNEL_QUEUE_CAPACITY: usize = 16;
 const CHANNEL_QUEUE_MASK: usize = CHANNEL_QUEUE_CAPACITY - 1;
@@ -140,6 +143,13 @@ fn guest_print_bytes(data: &[u8]) {
     }
 }
 
+/// Trigger NIC TX via EPT MMIO passthrough (zero host VM-exits).
+fn trigger_e1000_tx_passthrough() {
+    unsafe {
+        core::ptr::write_volatile(E1000_TDT_GPA as *mut u32, 1);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
     guest_print("VM2 waiting for IPC ping...\n");
@@ -154,6 +164,7 @@ pub extern "C" fn _start() -> ! {
 
                 let ack_ch = &mut *((SHARED_IPC_GPA + CHANNEL_SLOT_SIZE as u64) as *mut UnidirectionalChannel);
                 let _ = channel_send(ack_ch, b"ack from VM2");
+                trigger_e1000_tx_passthrough();
                 true
             } else {
                 false

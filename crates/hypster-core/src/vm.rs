@@ -110,10 +110,10 @@ impl VirtualMachine {
         }
     }
 
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
+    /// Legacy host-simulated e1000 + channel path for [`Hypervisor::run`] only.
+    ///
+    /// Target B dual-partition bring-up uses [`crate::guest_run::run_vcpu_once`] instead;
+    /// VM2 egress is guest MMIO via EPT passthrough (no host `VirtualE1000` polling here).
     pub fn run_vcpu_step(
         &mut self,
         vcpu_id: usize,
