@@ -56,11 +56,13 @@ static mut VM1_PML4: EptPageTable = EptPageTable::new();
 static mut VM1_PDPT: EptPageTable = EptPageTable::new();
 static mut VM1_PD: EptPageTable = EptPageTable::new();
 static mut VM1_PT: EptPageTable = EptPageTable::new();
+static mut VM1_PT2: EptPageTable = EptPageTable::new();
 
 static mut VM2_PML4: EptPageTable = EptPageTable::new();
 static mut VM2_PDPT: EptPageTable = EptPageTable::new();
 static mut VM2_PD: EptPageTable = EptPageTable::new();
 static mut VM2_PT: EptPageTable = EptPageTable::new();
+static mut VM2_PT2: EptPageTable = EptPageTable::new();
 
 /// TSF Subsystem Structure  implementing CC EAL5+ security controls.
 /// Common Criteria EAL5+ TSF Subsystem Interface Definition.
@@ -76,6 +78,9 @@ pub struct EptManager {
     pub pd_ptr: *mut EptPageTable,
     /// TSF security attribute field 
     pub pt_ptr: *mut EptPageTable,
+    /// Second page table for GPA 2 MiB..4 MiB (512 × 4 KiB leaves).
+    /// TSF security attribute field 
+    pub pt2_ptr: *mut EptPageTable,
 }
 
 /// Subsystem implementation enforcing EAL5+ Security Functional Requirements (SFRs).
@@ -93,6 +98,7 @@ impl EptManager {
                 pdpt_ptr: core::ptr::addr_of_mut!(VM1_PDPT),
                 pd_ptr: core::ptr::addr_of_mut!(VM1_PD),
                 pt_ptr: core::ptr::addr_of_mut!(VM1_PT),
+                pt2_ptr: core::ptr::addr_of_mut!(VM1_PT2),
             }
         } else {
             Self {
@@ -101,6 +107,7 @@ impl EptManager {
                 pdpt_ptr: core::ptr::addr_of_mut!(VM2_PDPT),
                 pd_ptr: core::ptr::addr_of_mut!(VM2_PD),
                 pt_ptr: core::ptr::addr_of_mut!(VM2_PT),
+                pt2_ptr: core::ptr::addr_of_mut!(VM2_PT2),
             }
         }
     }
@@ -121,7 +128,6 @@ impl EptManager {
             let pml4 = &mut *self.pml4_ptr;
             let pdpt = &mut *self.pdpt_ptr;
             let pd = &mut *self.pd_ptr;
-            let pt = &mut *self.pt_ptr;
 
             // Point PML4 entry to PDPT table
             let pdpt_hpa = pdpt as *const EptPageTable as u64;
@@ -131,16 +137,36 @@ impl EptManager {
             let pd_hpa = pd as *const EptPageTable as u64;
             pdpt.entries[pdpt_idx] = pd_hpa | flags;
 
-            // 4KB EPT leaves only. A 2MB leaf requires 2MB-aligned HPA; the UEFI
-            // partition buffer is 4KB-aligned, so 2MB leaves misconfigure EPT (exit 49).
-            // Target A fits in the first 2MB (code @0x1000, stack @0x1FF000).
-            let pt_hpa = pt as *const EptPageTable as u64;
-            pd.entries[0] = pt_hpa | flags;
-            let page_count_4kb = core::cmp::min((size_bytes + 0xFFF) / 0x1000, 512);
+            // 4 KiB EPT leaves only (2 MiB leaves need 2 MiB-aligned HPA under UEFI).
+            // Each PD entry points at one PT covering 2 MiB; use PT + PT2 for 4 MiB guests.
+            let pt0_ptr = self.pt_ptr;
+            let pt1_ptr = self.pt2_ptr;
+            let page_count_4kb = (size_bytes + 0xFFF) / 0x1000;
+            let pd_chunks = core::cmp::min((page_count_4kb + 511) / 512, 2);
+
+            for pd_i in 0..pd_chunks as usize {
+                let pt_hpa = if pd_i == 0 {
+                    pt0_ptr as u64
+                } else {
+                    pt1_ptr as u64
+                };
+                pd.entries[pd_i] = pt_hpa | flags;
+            }
+
             for i in 0..page_count_4kb as usize {
                 let page_gpa = gpa_base + (i as u64 * 0x1000);
-                let page_hpa = (hpa_base + (i as u64 * 0x1000)) & !0xFFF;
+                let pd_entry_idx = ((page_gpa >> 21) & 0x1FF) as usize;
                 let pt_entry_idx = ((page_gpa >> 12) & 0x1FF) as usize;
+                let page_hpa = (hpa_base + (i as u64 * 0x1000)) & !0xFFF;
+
+                let pt = if pd_entry_idx == 0 {
+                    &mut *pt0_ptr
+                } else if pd_entry_idx == 1 {
+                    &mut *pt1_ptr
+                } else {
+                    continue;
+                };
+
                 if pt_entry_idx < 512 {
                     pt.entries[pt_entry_idx] = page_hpa | flags | EPT_MEMORY_TYPE_WB;
                 }
@@ -227,7 +253,8 @@ impl EptManager {
             let pml4 = &*self.pml4_ptr;
             let pdpt = &*self.pdpt_ptr;
             let pd = &*self.pd_ptr;
-            let pt = &*self.pt_ptr;
+            let pt0 = &*self.pt_ptr;
+            let pt1 = &*self.pt2_ptr;
 
             if (pml4.entries[pml4_idx] & EPT_READ) == 0 {
         // Verify security policy condition bounds
@@ -252,7 +279,8 @@ impl EptManager {
                 return Some(hpa_page_base + page_offset);
             }
 
-            // Handle 4KB page translation
+            // Handle 4KB page translation (PD[0] -> PT, PD[1] -> PT2)
+            let pt = if pd_idx == 0 { pt0 } else if pd_idx == 1 { pt1 } else { return None };
             let pt_entry = pt.entries[pt_idx];
             if (pt_entry & EPT_READ) != 0 {
         // Verify security policy condition bounds

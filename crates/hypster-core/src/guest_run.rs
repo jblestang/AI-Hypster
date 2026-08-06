@@ -20,6 +20,8 @@ static mut ACTIVE_VCPU: *mut VCpu = core::ptr::null_mut();
 static GUEST_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static mut SAVED_GUEST_RAX: u64 = 0;
 static mut SAVED_GUEST_RCX: u64 = 0;
+static CPUID_PATCH_PENDING: AtomicBool = AtomicBool::new(false);
+static mut CPUID_GPR: [u64; 4] = [0; 4]; // rax, rbx, rcx, rdx
 
 #[repr(C, align(16))]
 struct HostExitStack([u8; 4096]);
@@ -53,7 +55,11 @@ core::arch::global_asm!(
     "sub rsp, 8",
     "push rcx",
     "call vmx_handle_exit",
+    "mov r11b, al",
     "pop rsp",
+    "mov rdi, rsp",
+    "call apply_cpuid_patch",
+    "movzx eax, r11b",
     "test al, al",
     "jz 1f",
     "pop rax",
@@ -100,6 +106,21 @@ fn host_exit_rsp_anchor() -> u64 {
 extern "C" fn vmwrite_host_rsp(rsp: u64) {
     unsafe {
         vmwrite(crate::vmx::VMCS_HOST_RSP, rsp);
+    }
+}
+
+#[no_mangle]
+extern "C" fn apply_cpuid_patch(gpr_stack: *mut u64) {
+    if !CPUID_PATCH_PENDING.load(Ordering::Acquire) {
+        return;
+    }
+    CPUID_PATCH_PENDING.store(false, Ordering::Release);
+    unsafe {
+        // Stack layout (top first): rax, rcx, rdx, rbx, ...
+        *gpr_stack.add(0) = CPUID_GPR[0];
+        *gpr_stack.add(1) = CPUID_GPR[2];
+        *gpr_stack.add(2) = CPUID_GPR[3];
+        *gpr_stack.add(3) = CPUID_GPR[1];
     }
 }
 
@@ -153,19 +174,10 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
             vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
             !GUEST_STOP_REQUESTED.load(Ordering::SeqCst)
         } else if exit_reason == 10 {
-            // CPUID
+            // CPUID — patch guest GPR stack slots before vmresume (see apply_cpuid_patch).
             let (eax, ebx, ecx, edx) = emulate_cpuid(guest_rax, guest_rcx);
-            core::arch::asm!(
-                "mov rax, {0}",
-                "mov rbx, {1}",
-                "mov rcx, {2}",
-                "mov rdx, {3}",
-                in(reg) eax as u64,
-                in(reg) ebx as u64,
-                in(reg) ecx as u64,
-                in(reg) edx as u64,
-                options(nostack, preserves_flags),
-            );
+            CPUID_GPR = [eax as u64, ebx as u64, ecx as u64, edx as u64];
+            CPUID_PATCH_PENDING.store(true, Ordering::Release);
             vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
             true
         } else if exit_reason == 2 {

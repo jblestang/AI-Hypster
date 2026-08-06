@@ -549,10 +549,14 @@ mod tests {
     }
 
     #[test]
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
+    fn test_ept_maps_second_2mb_chunk() {
+        let mut ept = ept::EptManager::new(0);
+        ept.map_region(0, 0x100_0000, 4 * 1024 * 1024);
+        assert_eq!(ept.translate_gpa(0x1000).unwrap(), 0x100_1000);
+        assert_eq!(ept.translate_gpa(0x2_10_000).unwrap(), 0x100_0000 + 0x2_10_000);
+    }
+
+    #[test]
     fn test_iommu_context_table_entry() {
         let mut iommu = iommu::IommuManager::new();
         iommu.create_domain(1, 1, 0x140213000, 0x140413000);

@@ -48,6 +48,7 @@ pub const IA32_VMX_TRUE_PINBASED_CTLS_MSR: u32 = 0x0000048D;
 pub const IA32_VMX_TRUE_PROCBASED_CTLS_MSR: u32 = 0x0000048E;
 pub const IA32_VMX_TRUE_EXIT_CTLS_MSR: u32 = 0x0000048F;
 pub const IA32_VMX_TRUE_ENTRY_CTLS_MSR: u32 = 0x00000490;
+pub const IA32_EFER_MSR: u32 = 0xC0000080;
 pub const VMCS_HOST_IA32_EFER: u32 = 0x00002C02;
 
 // ============================================================================
@@ -720,7 +721,7 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: 
     vmwrite(0x00004C00, read_msr(0x174));
     vmwrite(0x00006C10, read_msr(0x175));
     vmwrite(0x00006C12, read_msr(0x176));
-    vmwrite(VMCS_HOST_IA32_EFER, guest_efer);
+    vmwrite(VMCS_HOST_IA32_EFER, read_msr(IA32_EFER_MSR));
 
     serial_print("[HYPSTER-VTX] Hardware VMCS Region Configured for VM ");
     crate::serial::serial_print_dec(vcpu.id as u64);
