@@ -65,6 +65,11 @@ impl VirtualMachine {
 
         let mut ept = crate::ept::EptManager::new(id);
         ept.map_region(0x0, mem_base_hpa, ram_bytes);
+        ept.map_shared_region(
+            crate::ipc_region::SHARED_IPC_GPA,
+            crate::config::SHARED_IPC_RING_BASE_HPA,
+            crate::config::SHARED_IPC_RING_SIZE,
+        );
 
         // Map Direct Hardware MMIO BAR (Bao/Jailhouse model) dynamically into Driver Domain EPT (0 VM-Exits!)
         if id == 1 {

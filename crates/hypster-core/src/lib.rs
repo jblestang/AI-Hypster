@@ -24,6 +24,7 @@ pub mod vmx;
 pub mod vmexit;
 pub mod serial;
 pub mod channel;
+pub mod ipc_region;
 pub mod scheduler;
 pub mod iommu;
 pub mod pci;

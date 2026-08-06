@@ -37,7 +37,7 @@ assigned_pci_devices:
 
 shared_ipc:
   base_hpa: 0x0000_0001_4041_3000
-  size: 0x0000_0000_0000_5000
+  size: 0x0000_0000_0000_D000
 
 iommu:
   dmar_base_hpa: 0x0000_0000_FED9_0000
