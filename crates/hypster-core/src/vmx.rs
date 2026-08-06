@@ -542,7 +542,8 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
     vmwrite(VMCS_HOST_SS_SELECTOR, 0x30);
     vmwrite(VMCS_HOST_FS_SELECTOR, 0x0);
     vmwrite(VMCS_HOST_GS_SELECTOR, 0x0);
-    vmwrite(VMCS_HOST_TR_SELECTOR, 0x0);
+    vmwrite(VMCS_HOST_TR_SELECTOR, 0x28); // Valid GDT Task State Segment (TSS) Selector
+    vmwrite(0x00006C0A, 0x0u64);          // VMCS_HOST_TR_BASE (Host TSS Base Address)
 
     serial_print("[HYPSTER-VTX] Hardware VMCS Region Configured for VM ");
     crate::serial::serial_print_dec(vcpu.id as u64);

@@ -40,7 +40,7 @@ impl LocalApicDriver {
         }
     }
 
-    /// Broadcast INIT-SIPI-SIPI IPI sequence to wake up secondary physical AP core
+    /// Broadcast INIT-SIPI-SIPI IPI sequence to wake up secondary physical AP core (§6)
     pub unsafe fn send_init_sipi_sipi(&self, target_apic_id: u32, vector: u8) {
         if cfg!(test) {
             return;
@@ -53,17 +53,32 @@ impl LocalApicDriver {
         core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
         core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_INIT | 0x4000);
 
-        for _ in 0..100_000 { core::hint::spin_loop(); }
+        // TSC-calibrated 10 ms (10,000 us) hardware INIT reset delay
+        Self::delay_us(10_000);
 
         // 2. Issue SIPI 1
         core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
         core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_STARTUP | (vector as u32));
 
-        for _ in 0..10_000 { core::hint::spin_loop(); }
+        // TSC-calibrated 200 us SIPI delay
+        Self::delay_us(200);
 
         // 3. Issue SIPI 2
         core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
         core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_STARTUP | (vector as u32));
+    }
+
+    /// Calibrated microsecond delay using CPU Time Stamp Counter (TSC)
+    fn delay_us(us: u64) {
+        if cfg!(test) {
+            return;
+        }
+        let cpu_freq_mhz = 3000u64; // 3.0 GHz baseline
+        let target_cycles = us * cpu_freq_mhz;
+        let start = unsafe { core::arch::x86_64::_rdtsc() };
+        while unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(start) < target_cycles {
+            core::hint::spin_loop();
+        }
     }
 }
 
