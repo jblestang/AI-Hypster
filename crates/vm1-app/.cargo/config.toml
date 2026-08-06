@@ -2,4 +2,6 @@
 target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
-rustflags = ["-C", "link-arg=-T/workspace/crates/vm1-app/linker.ld"]
+# Relative to this crate root (crates/vm1-app/). run_qemu.sh also sets RUSTFLAGS
+# when building from the workspace root.
+rustflags = ["-C", "link-arg=-Tlinker.ld"]

@@ -44,6 +44,11 @@ pub const IA32_VMX_CR0_FIXED1_MSR: u32 = 0x00000487;
 pub const IA32_VMX_CR4_FIXED0_MSR: u32 = 0x00000488;
 pub const IA32_VMX_CR4_FIXED1_MSR: u32 = 0x00000489;
 pub const IA32_VMX_PROCBASED_CTLS2_MSR: u32 = 0x0000048B;
+pub const IA32_VMX_TRUE_PINBASED_CTLS_MSR: u32 = 0x0000048D;
+pub const IA32_VMX_TRUE_PROCBASED_CTLS_MSR: u32 = 0x0000048E;
+pub const IA32_VMX_TRUE_EXIT_CTLS_MSR: u32 = 0x0000048F;
+pub const IA32_VMX_TRUE_ENTRY_CTLS_MSR: u32 = 0x00000490;
+pub const VMCS_HOST_IA32_EFER: u32 = 0x00002C02;
 
 // ============================================================================
 // VMCS Field Encodings (Intel SDM Vol 3C Component Encodings)
@@ -177,18 +182,18 @@ pub const VMCS_GUEST_GS_AR_BYTES: u32 = 0x0000481E;
 pub const VMCS_GUEST_LDTR_AR_BYTES: u32 = 0x00004820;
 pub const VMCS_GUEST_TR_AR_BYTES: u32 = 0x00004822;
 
-// Natural-Width Control, Guest & Host State Fields
-pub const VMCS_GUEST_CR0: u32 = 0x00006004;
-pub const VMCS_GUEST_CR3: u32 = 0x00006002;
-pub const VMCS_GUEST_CR4: u32 = 0x00006006;
-pub const VMCS_GUEST_ES_BASE: u32 = 0x00006800;
-pub const VMCS_GUEST_CS_BASE: u32 = 0x00006802;
-pub const VMCS_GUEST_SS_BASE: u32 = 0x00006804;
-pub const VMCS_GUEST_DS_BASE: u32 = 0x00006806;
-pub const VMCS_GUEST_FS_BASE: u32 = 0x00006808;
-pub const VMCS_GUEST_GS_BASE: u32 = 0x0000680A;
-pub const VMCS_GUEST_LDTR_BASE: u32 = 0x0000680C;
-pub const VMCS_GUEST_TR_BASE: u32 = 0x0000680E;
+// Natural-Width Control, Guest & Host State Fields (Intel SDM Vol 3D Appendix B)
+pub const VMCS_GUEST_CR0: u32 = 0x00006800;
+pub const VMCS_GUEST_CR3: u32 = 0x00006802;
+pub const VMCS_GUEST_CR4: u32 = 0x00006804;
+pub const VMCS_GUEST_ES_BASE: u32 = 0x00006806;
+pub const VMCS_GUEST_CS_BASE: u32 = 0x00006808;
+pub const VMCS_GUEST_SS_BASE: u32 = 0x0000680A;
+pub const VMCS_GUEST_DS_BASE: u32 = 0x0000680C;
+pub const VMCS_GUEST_FS_BASE: u32 = 0x0000680E;
+pub const VMCS_GUEST_GS_BASE: u32 = 0x00006810;
+pub const VMCS_GUEST_LDTR_BASE: u32 = 0x00006812;
+pub const VMCS_GUEST_TR_BASE: u32 = 0x00006814;
 pub const VMCS_GUEST_GDTR_BASE: u32 = 0x00006816;
 pub const VMCS_GUEST_IDTR_BASE: u32 = 0x00006818;
 pub const VMCS_GUEST_RSP: u32 = 0x0000681C;
@@ -383,12 +388,12 @@ pub unsafe fn vmread(field: u32) -> u64 {
     let cr4: u64;
     asm!("mov {}, cr4", out(reg) cr4);
     if (cr4 & (1 << 13)) != 0 {
-        // Verify security policy condition bounds
+        // VMREAD reads host memory (the current VMCS) — must not be `nomem`.
         asm!(
             "vmread {0}, {1}",
             out(reg) val,
             in(reg) field as u64,
-            options(nomem, nostack)
+            options(nostack)
         );
     }
     val
@@ -400,12 +405,13 @@ pub unsafe fn vmwrite(field: u32, val: u64) {
     let cr4: u64;
     asm!("mov {}, cr4", out(reg) cr4);
     if (cr4 & (1 << 13)) != 0 {
-        // Verify security policy condition bounds
+        // VMWRITE writes host memory (the current VMCS) — must not be `nomem`
+        // or LLVM may reorder/elide writes across the asm blocks.
         asm!(
             "vmwrite {0}, {1}",
             in(reg) field as u64,
             in(reg) val,
-            options(nomem, nostack)
+            options(nostack)
         );
     }
 }
@@ -564,12 +570,13 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: 
 
     vmwrite(VMCS_LINK_POINTER, 0xFFFF_FFFF_FFFF_FFFF);
 
-    // Pin-based: no preemption timer. Secondary: EPT + unrestricted guest. Entry: IA-32e guest.
-    let pin_ctls = (read_msr(IA32_VMX_PINBASED_CTLS_MSR) & 0xFFFFFFFF) as u32;
-    let proc_ctls = (read_msr(IA32_VMX_PROCBASED_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 31);
-    let sec_proc_ctls = (read_msr(IA32_VMX_PROCBASED_CTLS2_MSR) & 0xFFFFFFFF) as u32 | (1 << 1) | (1 << 7);
-    let exit_ctls = (read_msr(IA32_VMX_EXIT_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 9);
-    let entry_ctls = (read_msr(IA32_VMX_ENTRY_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 9);
+    // Non-TRUE capability MSRs report default1 bits as 1 in the low half, so the
+    // standard (desired | allowed0) & allowed1 adjust keeps always-on bits set.
+    let pin_ctls = adjust_vmx_ctl(0, read_msr(IA32_VMX_PINBASED_CTLS_MSR));
+    let proc_ctls = adjust_vmx_ctl(1 << 31, read_msr(IA32_VMX_PROCBASED_CTLS_MSR));
+    let sec_proc_ctls = adjust_vmx_ctl(1 << 1, read_msr(IA32_VMX_PROCBASED_CTLS2_MSR)); // EPT only
+    let exit_ctls = adjust_vmx_ctl(1 << 9, read_msr(IA32_VMX_EXIT_CTLS_MSR));
+    let entry_ctls = adjust_vmx_ctl((1 << 2) | (1 << 9) | (1 << 15), read_msr(IA32_VMX_ENTRY_CTLS_MSR));
 
     vmwrite(VMCS_PIN_BASED_VM_EXEC_CONTROL, pin_ctls as u64);
     vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, proc_ctls as u64);
@@ -577,68 +584,26 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: 
     vmwrite(VMCS_VM_EXIT_CONTROLS, exit_ctls as u64);
     vmwrite(VMCS_VM_ENTRY_CONTROLS, entry_ctls as u64);
 
-    // 2. Set EPTP, MSR Bitmaps Pointer & Preemption Timer
+    // Non-TRUE adjust forces "use MSR bitmaps" (bit 26) on — point at a zeroed page.
+    if (proc_ctls & (1 << 26)) != 0 {
+        let bitmap = if vcpu.id == 0 {
+            core::ptr::addr_of_mut!(MSR_BITMAP_1)
+        } else {
+            core::ptr::addr_of_mut!(MSR_BITMAP_2)
+        };
+        vmwrite(VMCS_MSR_BITMAP, bitmap as u64);
+    }
+
+    serial_print("[HYPSTER-VTX] CTLS pin=");
+    serial_print_hex(pin_ctls as u64);
+    serial_print(" entry=");
+    serial_print_hex(entry_ctls as u64);
+    serial_print("\n");
     let eptp = (ept_pml4_pa & !0xFFF) | (3 << 3) | 6;
     vmwrite(VMCS_EPT_POINTER, eptp);
 
-    // 3. Write Guest State Fields
-    vmwrite(VMCS_GUEST_RIP, vcpu.registers.rip);
-    vmwrite(VMCS_GUEST_RSP, vcpu.registers.rsp);
-    vmwrite(VMCS_GUEST_RFLAGS, 0x2);
-
-    vmwrite(VMCS_GUEST_CS_SELECTOR, 0x08);
-    vmwrite(VMCS_GUEST_CS_BASE, 0x0);
-    vmwrite(VMCS_GUEST_CS_LIMIT, 0xFFFFFFFF);
-    vmwrite(VMCS_GUEST_CS_AR_BYTES, 0xA09B); // Present, 64-bit code, exec/read
-
-    vmwrite(VMCS_GUEST_DS_SELECTOR, 0x10);
-    vmwrite(VMCS_GUEST_DS_BASE, 0x0);
-    vmwrite(VMCS_GUEST_DS_LIMIT, 0xFFFFFFFF);
-    vmwrite(VMCS_GUEST_DS_AR_BYTES, 0xC093); // Present, Data, Read/Write
-
-    vmwrite(VMCS_GUEST_ES_SELECTOR, 0x10);
-    vmwrite(VMCS_GUEST_SS_SELECTOR, 0x10);
-    vmwrite(VMCS_GUEST_FS_SELECTOR, 0x0);
-    vmwrite(VMCS_GUEST_GS_SELECTOR, 0x0);
-    vmwrite(VMCS_GUEST_LDTR_SELECTOR, 0x0);
-    vmwrite(VMCS_GUEST_TR_SELECTOR, 0x0);
-
-    vmwrite(VMCS_GUEST_ES_LIMIT, 0xFFFFFFFF);
-    vmwrite(VMCS_GUEST_SS_LIMIT, 0xFFFFFFFF);
-    vmwrite(VMCS_GUEST_FS_LIMIT, 0xFFFFFFFF);
-    vmwrite(VMCS_GUEST_GS_LIMIT, 0xFFFFFFFF);
-    vmwrite(VMCS_GUEST_LDTR_LIMIT, 0);
-    vmwrite(VMCS_GUEST_TR_LIMIT, 0xFFFF);
-
-    vmwrite(VMCS_GUEST_ES_AR_BYTES, 0xC093);
-    vmwrite(VMCS_GUEST_SS_AR_BYTES, 0xC093);
-    vmwrite(VMCS_GUEST_FS_AR_BYTES, 0xC093);
-    vmwrite(VMCS_GUEST_GS_AR_BYTES, 0xC093);
-    vmwrite(VMCS_GUEST_LDTR_AR_BYTES, 0x10000); // Unusable
-    vmwrite(VMCS_GUEST_TR_AR_BYTES, 0x10000);   // Unusable (no guest TSS required)
-
-    // 3. Compute guest CR0 and CR4 using hardware IA32_VMX_CR0_FIXED0/FIXED1 MSRs
-    let fixed0_cr0 = unsafe { read_msr(IA32_VMX_CR0_FIXED0_MSR) };
-    let fixed1_cr0 = unsafe { read_msr(IA32_VMX_CR0_FIXED1_MSR) };
-    let fixed0_cr4 = unsafe { read_msr(IA32_VMX_CR4_FIXED0_MSR) };
-    let fixed1_cr4 = unsafe { read_msr(IA32_VMX_CR4_FIXED1_MSR) };
-
-    let guest_cr0 = (0x80000001u64 | fixed0_cr0) & fixed1_cr0; // PE | PG
-    let guest_cr4 = (0x20u64 | fixed0_cr4) & fixed1_cr4;        // PAE
-
-    unsafe {
-        // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
-        vmwrite(VMCS_GUEST_CR0, guest_cr0);
-        vmwrite(VMCS_GUEST_CR3, guest_cr3);
-        vmwrite(VMCS_GUEST_CR4, guest_cr4);
-        vmwrite(VMCS_GUEST_IA32_EFER, 0x500); // LME | LMA
-        vmwrite(VMCS_GUEST_GDTR_BASE, 0x7000);
-        vmwrite(VMCS_GUEST_IDTR_BASE, 0x7000);
-        vmwrite(VMCS_GUEST_GDTR_LIMIT, 0xFFFF);
-        vmwrite(VMCS_GUEST_IDTR_LIMIT, 0xFFFF);
-    }
-
-    // 4. Write Host State Fields
+    // 3. Write Guest State Fields — mirror host segments/CRs (known valid), then
+    // overlay guest RIP/RSP/CR3 for the identity-mapped long-mode image.
     let mut host_cr0: u64;
     let mut host_cr3: u64;
     let mut host_cr4: u64;
@@ -646,25 +611,201 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: 
     asm!("mov {}, cr3", out(reg) host_cr3);
     asm!("mov {}, cr4", out(reg) host_cr4);
 
+    let mut hs_cs: u16; let mut hs_ss: u16; let mut hs_ds: u16;
+    let mut hs_es: u16; let mut hs_fs: u16; let mut hs_gs: u16; let mut hs_tr: u16;
+    asm!("mov {0:x}, cs", out(reg) hs_cs, options(nostack, nomem, preserves_flags));
+    asm!("mov {0:x}, ss", out(reg) hs_ss, options(nostack, nomem, preserves_flags));
+    asm!("mov {0:x}, ds", out(reg) hs_ds, options(nostack, nomem, preserves_flags));
+    asm!("mov {0:x}, es", out(reg) hs_es, options(nostack, nomem, preserves_flags));
+    asm!("mov {0:x}, fs", out(reg) hs_fs, options(nostack, nomem, preserves_flags));
+    asm!("mov {0:x}, gs", out(reg) hs_gs, options(nostack, nomem, preserves_flags));
+    asm!("str {0:x}", out(reg) hs_tr, options(nostack, nomem, preserves_flags));
+
+    let mut gdtr = DescriptorTableRegister { limit: 0, base: 0 };
+    let mut idtr = DescriptorTableRegister { limit: 0, base: 0 };
+    asm!("sgdt [{}]", in(reg) &mut gdtr, options(nostack));
+    asm!("sidt [{}]", in(reg) &mut idtr, options(nostack));
+
+    // Guest TR selector must be ≠ 0 and usable (SDM §26.3.1.2). OVMF often has
+    // TR=0 — install a TSS before programming guest/host TR fields.
+    let mut tr_sel = hs_tr & 0xFFF8;
+    if tr_sel == 0 {
+        tr_sel = ensure_host_tss();
+        asm!("sgdt [{}]", in(reg) &mut gdtr, options(nostack));
+    }
+    let tr_base = read_segment_base(gdtr.base, tr_sel);
+
+    // Guest CRs: PE|PG|ET|NE, PAE; keep VMXE set — nested KVM applies
+    // CR4_FIXED0 without the SDM special-case that allows guest VMXE=0.
+    let guest_cr0 = host_cr0 | 0x80000031;
+    let guest_cr4 = host_cr4 | 0x20; // PAE; retain VMXE for nested VT-x
+    let guest_efer = 0x500u64; // LME|LMA
+
+    vmwrite(VMCS_GUEST_CR0, guest_cr0);
+    vmwrite(VMCS_GUEST_CR3, guest_cr3);
+    vmwrite(VMCS_GUEST_CR4, guest_cr4);
+    vmwrite(VMCS_GUEST_IA32_EFER, guest_efer);
+    vmwrite(VMCS_GUEST_RIP, vcpu.registers.rip);
+    vmwrite(VMCS_GUEST_RSP, vcpu.registers.rsp);
+    vmwrite(VMCS_GUEST_RFLAGS, 0x2);
+
+    // Synthetic long-mode segments; GDT at guest GPA 0x7000 from guest_boot.
+    vmwrite(VMCS_GUEST_CS_SELECTOR, 0x08);
+    vmwrite(VMCS_GUEST_SS_SELECTOR, 0x10);
+    vmwrite(VMCS_GUEST_DS_SELECTOR, 0x10);
+    vmwrite(VMCS_GUEST_ES_SELECTOR, 0x10);
+    vmwrite(VMCS_GUEST_FS_SELECTOR, 0);
+    vmwrite(VMCS_GUEST_GS_SELECTOR, 0);
+    vmwrite(VMCS_GUEST_TR_SELECTOR, 0x18);
+    vmwrite(VMCS_GUEST_LDTR_SELECTOR, 0);
+
+    vmwrite(VMCS_GUEST_CS_BASE, 0);
+    vmwrite(VMCS_GUEST_SS_BASE, 0);
+    vmwrite(VMCS_GUEST_DS_BASE, 0);
+    vmwrite(VMCS_GUEST_ES_BASE, 0);
+    vmwrite(VMCS_GUEST_FS_BASE, 0);
+    vmwrite(VMCS_GUEST_GS_BASE, 0);
+    vmwrite(VMCS_GUEST_TR_BASE, 0);
+    vmwrite(VMCS_GUEST_LDTR_BASE, 0);
+
+    vmwrite(VMCS_GUEST_CS_LIMIT, 0xFFFFFFFF);
+    vmwrite(VMCS_GUEST_SS_LIMIT, 0xFFFFFFFF);
+    vmwrite(VMCS_GUEST_DS_LIMIT, 0xFFFFFFFF);
+    vmwrite(VMCS_GUEST_ES_LIMIT, 0xFFFFFFFF);
+    vmwrite(VMCS_GUEST_FS_LIMIT, 0);
+    vmwrite(VMCS_GUEST_GS_LIMIT, 0);
+    vmwrite(VMCS_GUEST_TR_LIMIT, 0x67);
+    vmwrite(VMCS_GUEST_LDTR_LIMIT, 0);
+
+    vmwrite(VMCS_GUEST_CS_AR_BYTES, 0xA09B);
+    vmwrite(VMCS_GUEST_SS_AR_BYTES, 0xC093);
+    vmwrite(VMCS_GUEST_DS_AR_BYTES, 0xC093);
+    vmwrite(VMCS_GUEST_ES_AR_BYTES, 0xC093);
+    vmwrite(VMCS_GUEST_FS_AR_BYTES, 0x10000);
+    vmwrite(VMCS_GUEST_GS_AR_BYTES, 0x10000);
+    vmwrite(VMCS_GUEST_TR_AR_BYTES, 0x8B);
+    vmwrite(VMCS_GUEST_LDTR_AR_BYTES, 0x10000);
+
+    vmwrite(VMCS_GUEST_GDTR_BASE, 0x7000);
+    vmwrite(VMCS_GUEST_IDTR_BASE, 0);
+    vmwrite(VMCS_GUEST_GDTR_LIMIT, 0x2F);
+    vmwrite(VMCS_GUEST_IDTR_LIMIT, 0);
+
+    vmwrite(0x0000681A, 0x400); // GUEST_DR7
+    vmwrite(0x00002802, 0);     // GUEST_IA32_DEBUGCTL
+    vmwrite(0x00004824, 0);
+    vmwrite(0x00004826, 0);
+    vmwrite(0x00006822, 0);
+    vmwrite(0x0000482A, 0);
+    vmwrite(0x00006824, 0);
+    vmwrite(0x00006826, 0);
+
     vmwrite(VMCS_HOST_CR0, host_cr0);
     vmwrite(VMCS_HOST_CR3, host_cr3);
     vmwrite(VMCS_HOST_CR4, host_cr4);
 
-    vmwrite(VMCS_HOST_CS_SELECTOR, 0x38); // UEFI 64-bit CS
-    vmwrite(VMCS_HOST_DS_SELECTOR, 0x30);
-    vmwrite(VMCS_HOST_SS_SELECTOR, 0x30);
-    vmwrite(VMCS_HOST_FS_SELECTOR, 0x0);
-    vmwrite(VMCS_HOST_GS_SELECTOR, 0x0);
-    vmwrite(VMCS_HOST_TR_SELECTOR, 0x0);
+    vmwrite(VMCS_HOST_CS_SELECTOR, (hs_cs & 0xFFF8) as u64);
+    vmwrite(VMCS_HOST_SS_SELECTOR, (hs_ss & 0xFFF8) as u64);
+    vmwrite(VMCS_HOST_DS_SELECTOR, (hs_ds & 0xFFF8) as u64);
+    vmwrite(VMCS_HOST_ES_SELECTOR, (hs_es & 0xFFF8) as u64);
+    vmwrite(VMCS_HOST_FS_SELECTOR, (hs_fs & 0xFFF8) as u64);
+    vmwrite(VMCS_HOST_GS_SELECTOR, (hs_gs & 0xFFF8) as u64);
+    vmwrite(VMCS_HOST_TR_SELECTOR, tr_sel as u64);
 
-    vmwrite(VMCS_HOST_FS_BASE, 0);
-    vmwrite(VMCS_HOST_GS_BASE, 0);
+    vmwrite(VMCS_HOST_FS_BASE, read_msr(0xC0000100));
+    vmwrite(VMCS_HOST_GS_BASE, read_msr(0xC0000101));
+    vmwrite(VMCS_HOST_TR_BASE, tr_base);
+    vmwrite(VMCS_HOST_GDTR_BASE, gdtr.base);
+    vmwrite(VMCS_HOST_IDTR_BASE, idtr.base);
+    vmwrite(0x00004C00, read_msr(0x174));
+    vmwrite(0x00006C10, read_msr(0x175));
+    vmwrite(0x00006C12, read_msr(0x176));
+    vmwrite(VMCS_HOST_IA32_EFER, guest_efer);
 
     serial_print("[HYPSTER-VTX] Hardware VMCS Region Configured for VM ");
     crate::serial::serial_print_dec(vcpu.id as u64);
     serial_print(" [EPTP: ");
     serial_print_hex(eptp);
     serial_print("]\n");
+}
+
+#[inline(always)]
+fn adjust_vmx_ctl(desired: u32, msr: u64) -> u32 {
+    let allowed0 = msr as u32;
+    let allowed1 = (msr >> 32) as u32;
+    (desired | allowed0) & allowed1
+}
+
+#[repr(C, packed)]
+struct DescriptorTableRegister {
+    limit: u16,
+    base: u64,
+}
+
+/// Decode a segment base from a GDT descriptor (handles 16-byte TSS descriptors).
+unsafe fn read_segment_base(gdt_base: u64, selector: u16) -> u64 {
+    if selector == 0 {
+        return 0;
+    }
+    let index = (selector >> 3) as u64;
+    let desc = *((gdt_base + index * 8) as *const u64);
+    // bits 16-39: base 0-23, bits 56-63: base 24-31
+    let base_0_23 = (desc >> 16) & 0xFF_FFFF;
+    let base_24_31 = (desc >> 56) & 0xFF;
+    let mut base = base_0_23 | (base_24_31 << 24);
+
+    // System descriptors (TSS) are 16 bytes in long mode — upper qword holds base 32-63.
+    let typ = ((desc >> 40) & 0xF) as u8;
+    let s_bit = ((desc >> 44) & 1) as u8;
+    if s_bit == 0 && (typ == 0x9 || typ == 0xB) {
+        let upper = *((gdt_base + index * 8 + 8) as *const u64);
+        base |= (upper & 0xFFFF_FFFF) << 32;
+    }
+    base
+}
+
+#[repr(C, align(16))]
+struct HostTss {
+    data: [u8; 104],
+}
+
+static mut HOST_TSS: HostTss = HostTss { data: [0; 104] };
+static mut HOST_GDT: [u64; 16] = [0; 16];
+
+/// Ensure a non-zero host TR by copying the live GDT and appending a busy 64-bit TSS.
+unsafe fn ensure_host_tss() -> u16 {
+    let mut gdtr = DescriptorTableRegister { limit: 0, base: 0 };
+    asm!("sgdt [{}]", in(reg) &mut gdtr, options(nostack));
+
+    let old_count = ((gdtr.limit as usize) + 1) / 8;
+    let copy_n = core::cmp::min(old_count, 14);
+    for i in 0..copy_n {
+        HOST_GDT[i] = *((gdtr.base as *const u64).add(i));
+    }
+
+    let tss_pa = core::ptr::addr_of_mut!(HOST_TSS) as u64;
+    let limit = (core::mem::size_of::<HostTss>() - 1) as u64;
+    let typ_busy_tss64: u64 = 0x89; // Present | 64-bit TSS (available); LTR makes it busy
+    // First 8 bytes of 16-byte TSS descriptor
+    let desc_low = (limit & 0xFFFF)
+        | ((tss_pa & 0xFF_FFFF) << 16)
+        | (typ_busy_tss64 << 40)
+        | (((limit >> 16) & 0xF) << 48)
+        | (((tss_pa >> 24) & 0xFF) << 56);
+    let desc_high = (tss_pa >> 32) & 0xFFFF_FFFF;
+    HOST_GDT[copy_n] = desc_low;
+    HOST_GDT[copy_n + 1] = desc_high;
+
+    let new_limit = ((copy_n + 2) * 8 - 1) as u16;
+    let new_gdtr = DescriptorTableRegister {
+        limit: new_limit,
+        base: core::ptr::addr_of_mut!(HOST_GDT) as u64,
+    };
+    asm!("lgdt [{}]", in(reg) &new_gdtr, options(readonly, nostack));
+
+    let selector = (copy_n as u16) << 3;
+    asm!("ltr {0:x}", in(reg) selector, options(nostack, preserves_flags));
+    selector
 }
 
 // ============================================================================

@@ -3,8 +3,12 @@ set -e
 
 echo "=== Building Hypster Target A: minimal guest + UEFI loader ==="
 rustup target add x86_64-unknown-none x86_64-unknown-uefi 2>/dev/null || true
+# Absolute linker script path — relative -Tlinker.ld breaks when cargo is
+# invoked from the workspace root rather than crates/vm1-app.
+export RUSTFLAGS="-C link-arg=-T${PWD}/crates/vm1-app/linker.ld"
 cargo build --target x86_64-unknown-none --release -p vm1-app
 objcopy -O binary target/x86_64-unknown-none/release/vm1-app target/x86_64-unknown-none/release/vm1-app.bin
+unset RUSTFLAGS
 cargo build --target x86_64-unknown-uefi --release -p hypster-uefi
 
 echo "=== Preparing UEFI boot image ==="

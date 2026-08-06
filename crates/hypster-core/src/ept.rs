@@ -131,38 +131,18 @@ impl EptManager {
             let pd_hpa = pd as *const EptPageTable as u64;
             pdpt.entries[pdpt_idx] = pd_hpa | flags;
 
-            if size_bytes <= 2 * 1024 * 1024 {
-        // Verify security policy condition bounds
-                // Point PD entry 0 to PT table for fine-grained 4KB mappings
-                let pt_hpa = pt as *const EptPageTable as u64;
-                pd.entries[0] = pt_hpa | flags;
-
-                let page_count_4kb = (size_bytes + 0xFFF) / 0x1000;
-                for i in 0..page_count_4kb as usize {
-        // Iterate through statically allocated TSF entries
-                    let page_gpa = gpa_base + (i as u64 * 0x1000);
-                    let page_hpa = hpa_base + (i as u64 * 0x1000);
-                    let pt_entry_idx = ((page_gpa >> 12) & 0x1FF) as usize;
-
-                    if pt_entry_idx < 512 {
-        // Verify security policy condition bounds
-                        // Enforce Read/Write/Execute permissions for 4KB pages
-                        pt.entries[pt_entry_idx] = page_hpa | flags | EPT_MEMORY_TYPE_WB;
-                    }
-                }
-            } else {
-                // Map 2MB Large Pages in PD table
-                let page_count_2mb = (size_bytes + 0x1F_FFFF) / 0x20_0000;
-                for i in 0..page_count_2mb as usize {
-        // Iterate through statically allocated TSF entries
-                    let page_gpa = gpa_base + (i as u64 * 0x20_0000);
-                    let page_hpa = hpa_base + (i as u64 * 0x20_0000);
-                    let pd_entry_idx = ((page_gpa >> 21) & 0x1FF) as usize;
-
-                    if pd_entry_idx < 512 {
-        // Verify security policy condition bounds
-                        pd.entries[pd_entry_idx] = page_hpa | flags | EPT_MEMORY_TYPE_WB | EPT_PAGE_SIZE_2MB;
-                    }
+            // 4KB EPT leaves only. A 2MB leaf requires 2MB-aligned HPA; the UEFI
+            // partition buffer is 4KB-aligned, so 2MB leaves misconfigure EPT (exit 49).
+            // Target A fits in the first 2MB (code @0x1000, stack @0x1FF000).
+            let pt_hpa = pt as *const EptPageTable as u64;
+            pd.entries[0] = pt_hpa | flags;
+            let page_count_4kb = core::cmp::min((size_bytes + 0xFFF) / 0x1000, 512);
+            for i in 0..page_count_4kb as usize {
+                let page_gpa = gpa_base + (i as u64 * 0x1000);
+                let page_hpa = (hpa_base + (i as u64 * 0x1000)) & !0xFFF;
+                let pt_entry_idx = ((page_gpa >> 12) & 0x1FF) as usize;
+                if pt_entry_idx < 512 {
+                    pt.entries[pt_entry_idx] = page_hpa | flags | EPT_MEMORY_TYPE_WB;
                 }
             }
         }
