@@ -1,0 +1,57 @@
+# Hypster Target Hardware & Partition Memory Layout Specification
+# Formatted for Common Criteria EAL5+ Static Configuration Verification
+
+hypervisor:
+  magic: 0x4859505354455201
+  version: 1
+  base_hpa: 0x0000_0001_4000_0000
+  ram_size: 0x0000_0000_0001_3000
+
+partitions:
+  partition1:
+    vm_id: 0
+    name: "VM1-Alpha"
+    ram_base_hpa: 0x0000_0001_4001_3000
+    ram_size: 0x0000_0000_0020_0000
+    pcpu_affinity: 0
+    pci_bus: 0
+    pci_device: 3
+    pci_function: 0
+  partition2:
+    vm_id: 1
+    name: "VM2-Beta"
+    ram_base_hpa: 0x0000_0001_4021_3000
+    ram_size: 0x0000_0000_0020_0000
+    pcpu_affinity: 1
+    pci_bus: 0
+    pci_device: 4
+    pci_function: 0
+
+shared_ipc:
+  base_hpa: 0x0000_0001_4041_3000
+  size: 0x0000_0000_0000_5000
+
+pci_bar0:
+  base_hpa: 0x0000_0000_C108_0000
+  size: 0x0000_0000_0002_0000
+
+iommu:
+  dmar_base_hpa: 0x0000_0000_FED9_0000
+
+uart16550:
+  com1_port: 0x03F8
+  baud_dll: 0x01
+  baud_dlm: 0x00
+  lcr_8n1: 0x03
+  fcr_enable_fifo: 0xC7
+
+apic:
+  init_delay_us: 10000
+  sipi_delay_us: 200
+
+posted_interrupts:
+  notification_vector: 0xF2
+
+cat_l3:
+  clos0_mask: 0x00FF
+  clos1_mask: 0xFF00
