@@ -17,6 +17,7 @@
 
 extern crate alloc;
 
+pub mod dual_run;
 pub mod guest_boot;
 pub mod guest_run;
 pub mod ept;
@@ -36,6 +37,7 @@ pub mod pir;
 pub mod cat;
 pub mod ras;
 
+pub use dual_run::run_dual_partitions;
 pub use guest_run::run_single_guest;
 pub use vm::VirtualMachine;
 pub use channel::UnidirectionalChannel;
@@ -311,6 +313,28 @@ impl Hypervisor {
                     kbps,
                     mbps,
                 }
+    }
+
+    /// Return mutable vCPU for the given partition and vCPU index.
+    pub fn vcpu_mut(&mut self, vm_id: usize, vcpu_id: usize) -> Result<&mut vmx::VCpu, u64> {
+        let vm = match vm_id {
+            VM1_ID => &mut self.vm1,
+            VM2_ID => &mut self.vm2,
+            _ => return Err(1),
+        };
+        vm.vcpus
+            .get_mut(vcpu_id)
+            .and_then(|v| v.as_mut())
+            .ok_or(2)
+    }
+
+    /// EPT PML4 physical address for the given partition.
+    pub fn ept_pa(&self, vm_id: usize) -> u64 {
+        match vm_id {
+            VM1_ID => self.vm1.ept.pml4_ptr as u64,
+            VM2_ID => self.vm2.ept.pml4_ptr as u64,
+            _ => 0,
+        }
     }
 
     /// Executable TSF function  enforcing EAL5+ security policy rules.
