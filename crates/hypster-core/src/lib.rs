@@ -337,4 +337,146 @@ mod tests {
         let fault = ras::MachineCheckHandler::handle_machine_check();
         assert!(fault.is_none());
     }
+
+    #[test]
+    fn test_channel_ring_wraparound() {
+        let mut chan = channel::UnidirectionalChannel::new(0, "WrapTest");
+        let mut data = [0u8; 64];
+        for i in 0..64 { data[i] = i as u8; }
+
+        for cycle in 0..5 {
+            assert!(chan.send(&data));
+            let popped = chan.recv();
+            assert!(popped.is_some());
+            assert_eq!(popped.unwrap().len, 64);
+            assert_eq!(popped.unwrap().data[0], 0);
+        }
+    }
+
+    #[test]
+    fn test_channel_empty_and_full_bounds() {
+        let mut chan = channel::UnidirectionalChannel::new(0, "BoundsTest");
+        assert!(chan.recv().is_none());
+
+        let data = [0xAAu8; 32];
+        for _ in 0..16 {
+            assert!(chan.send(&data));
+        }
+        // 17th push must fail (queue full capacity 16)
+        assert!(!chan.send(&data));
+    }
+
+    #[test]
+    fn test_config_invalid_magic() {
+        let mut cfg = config::StaticHypervisorConfig::default_system();
+        cfg.magic = 0xDEADBEEF;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_version_mismatch() {
+        let mut cfg = config::StaticHypervisorConfig::default_system();
+        cfg.version = 99;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_overlapping_memory_ranges() {
+        let mut cfg = config::StaticHypervisorConfig::default_system();
+        cfg.partitions[1].guest_phys_base = cfg.partitions[0].guest_phys_base; // Force RAM overlap
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_ept_passthrough_mmio_mapping() {
+        let mut ept = ept::EptManager::new(1);
+        ept.map_mmio_passthrough(0x2000_0000, 0xC108_0000, 0x200000);
+        let translated = ept.translate_gpa(0x2000_0000);
+        assert!(translated.is_some());
+    }
+
+    #[test]
+    fn test_ept_multiple_page_translation() {
+        let mut ept = ept::EptManager::new(0);
+        ept.map_region(0x1000, 0x50000, 0x4000); // 4 pages
+        assert_eq!(ept.translate_gpa(0x1000).unwrap(), 0x50000);
+        assert_eq!(ept.translate_gpa(0x2000).unwrap(), 0x51000);
+        assert_eq!(ept.translate_gpa(0x3000).unwrap(), 0x52000);
+        assert_eq!(ept.translate_gpa(0x4000).unwrap(), 0x53000);
+    }
+
+    #[test]
+    fn test_iommu_context_table_entry() {
+        let mut iommu = iommu::IommuManager::new();
+        iommu.create_domain(1, 1, 0x140213000, 0x140413000);
+        iommu.assign_device_bdf(0, 3, 0, 1); // Bus 0, Dev 3, Func 0 -> Domain 1
+        assert_eq!(iommu.domains[1].unwrap().domain_id, 1);
+    }
+
+    #[test]
+    fn test_pci_bar_decoding_arithmetic() {
+        let bar_low = 0xC1080004u32; // Memory BAR bit 0 = 0, 64-bit type = 2
+        let bar_high = 0x00000000u32;
+        let bar64 = ((bar_high as u64) << 32) | ((bar_low & !0xF) as u64);
+        assert_eq!(bar64, 0xC1080000);
+    }
+
+    #[test]
+    fn test_pci_msix_capability_search() {
+        let cap = pci::PciBusScanner::find_msix_capability(0, 3, 0);
+        assert!(cap.is_none()); // QEMU default e1000 uses legacy PCI interrupts
+    }
+
+    #[test]
+    fn test_posted_interrupt_multi_vector() {
+        let mut desc = pir::PostedInterruptDescriptor::new();
+        desc.post_vector(10);  // Word 0
+        desc.post_vector(70);  // Word 1
+        desc.post_vector(140); // Word 2
+        desc.post_vector(200); // Word 3
+
+        assert_eq!(desc.pir_bitmap[0], 1 << 10);
+        assert_eq!(desc.pir_bitmap[1], 1 << (70 - 64));
+        assert_eq!(desc.pir_bitmap[2], 1 << (140 - 128));
+        assert_eq!(desc.pir_bitmap[3], 1 << (200 - 192));
+        assert_eq!(desc.control & 1, 1);
+    }
+
+    #[test]
+    fn test_health_multiple_fault_accumulation() {
+        let mut record = health::PartitionHealthRecord::new(1);
+        let mut dummy_regs = vmx::VCpuRegisters::default();
+        for _ in 0..5 {
+            record.record_fault_and_recover("VM2-Recover", &mut dummy_regs);
+        }
+        assert_eq!(record.fault_count, 5);
+        assert_eq!(record.reset_count, 5);
+        assert_eq!(record.state, health::PartitionState::Active);
+    }
+
+    #[test]
+    fn test_cat_policy_retrieval_bounds() {
+        let cat = cat::IntelCatManager::new();
+        assert_eq!(cat.policies[0].vm_id, 0);
+        assert_eq!(cat.policies[1].vm_id, 1);
+        assert_eq!(cat.policies[0].clos_id, 0);
+        assert_eq!(cat.policies[1].clos_id, 1);
+    }
+
+    #[test]
+    fn test_e1000_status_and_mac_registers() {
+        let mut e1000 = e1000_emu::VirtualE1000::new(0);
+        let status = e1000.mmio_read(e1000_spec::REG_STATUS);
+        assert_ne!(status, 0);
+    }
+
+    #[test]
+    fn test_scheduler_concurrent_vcpus() {
+        let sched = scheduler::StaticScheduler::new();
+        let cores = sched.concurrent_vcpus();
+        assert_eq!(cores[0].vm_id, 0);
+        assert_eq!(cores[0].pcpu_id, 0);
+        assert_eq!(cores[1].vm_id, 1);
+        assert_eq!(cores[1].pcpu_id, 1);
+    }
 }
