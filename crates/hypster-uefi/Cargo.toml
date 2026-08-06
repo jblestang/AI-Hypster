@@ -1,0 +1,12 @@
+[package]
+name = "hypster-uefi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uefi = { version = "0.33", features = ["global_allocator"] }
+
+hypster-core = { path = "../hypster-core" }
+x86_64 = { version = "0.14", default-features = false, features = ["instructions"] }
+
+

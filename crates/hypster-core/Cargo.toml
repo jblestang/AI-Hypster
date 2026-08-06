@@ -1,0 +1,11 @@
+[package]
+name = "hypster-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+e1000-spec = { path = "../e1000-spec" }
+x86_64 = { version = "0.14", default-features = false, features = ["instructions"] }
+spin = "0.9"
+
+

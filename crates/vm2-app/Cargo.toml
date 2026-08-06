@@ -1,0 +1,8 @@
+[package]
+name = "vm2-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+e1000-spec = { path = "../e1000-spec" }
+smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "socket-tcp", "medium-ethernet"] }

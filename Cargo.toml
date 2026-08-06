@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/e1000-spec",
+    "crates/hypster-core",
+    "crates/hypster-uefi",
+    "crates/vm1-app",
+    "crates/vm2-app",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
