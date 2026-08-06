@@ -49,23 +49,32 @@ impl LocalApicDriver {
         let icr_high_ptr = (self.base_hpa + APIC_ICR_HIGH as u64) as *mut u32;
         let icr_low_ptr = (self.base_hpa + APIC_ICR_LOW as u64) as *mut u32;
 
-        // 1. Issue INIT IPI
-        core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
-        core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_INIT | 0x4000);
+        // SAFETY: APIC ICR MMIO pointer writes to hardware LAPIC register base
+        unsafe {
+            // 1. Issue INIT IPI
+            core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
+            core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_INIT | 0x4000);
+        }
 
         // TSC-calibrated 10 ms (10,000 us) hardware INIT reset delay
         Self::delay_us(10_000);
 
-        // 2. Issue SIPI 1
-        core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
-        core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_STARTUP | (vector as u32));
+        // SAFETY: APIC ICR MMIO pointer writes for SIPI 1
+        unsafe {
+            // 2. Issue SIPI 1
+            core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
+            core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_STARTUP | (vector as u32));
+        }
 
         // TSC-calibrated 200 us SIPI delay
         Self::delay_us(200);
 
-        // 3. Issue SIPI 2
-        core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
-        core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_STARTUP | (vector as u32));
+        // SAFETY: APIC ICR MMIO pointer writes for SIPI 2
+        unsafe {
+            // 3. Issue SIPI 2
+            core::ptr::write_volatile(icr_high_ptr, target_apic_id << 24);
+            core::ptr::write_volatile(icr_low_ptr, APIC_DELIVERY_STARTUP | (vector as u32));
+        }
     }
 
     /// Calibrated microsecond delay using CPU Time Stamp Counter (TSC)

@@ -638,14 +638,17 @@ pub unsafe fn vmx_launch_or_resume(regs: *mut VCpuRegisters, launched: bool) -> 
         );
     }
 
-    if (launch_rflags & (1 | 0x40)) != 0 {
-        let err_code = vmread(VMCS_VM_INSTRUCTION_ERROR);
-        exit_reason = 0x8000_0000 | (err_code & 0xFFFF);
-    } else {
-        exit_reason = vmread(VMCS_VM_EXIT_REASON);
-        // Save updated guest RIP & RSP from VMCS only on successful VM Exit
-        (*regs).rip = vmread(VMCS_GUEST_RIP);
-        (*regs).rsp = vmread(VMCS_GUEST_RSP);
+    // SAFETY: Read VMCS hardware execution exit reason and updated guest RIP/RSP registers
+    unsafe {
+        if (launch_rflags & (1 | 0x40)) != 0 {
+            let err_code = vmread(VMCS_VM_INSTRUCTION_ERROR);
+            exit_reason = 0x8000_0000 | (err_code & 0xFFFF);
+        } else {
+            exit_reason = vmread(VMCS_VM_EXIT_REASON);
+            // Save updated guest RIP & RSP from VMCS only on successful VM Exit
+            (*regs).rip = vmread(VMCS_GUEST_RIP);
+            (*regs).rsp = vmread(VMCS_GUEST_RSP);
+        }
     }
 
     exit_reason
