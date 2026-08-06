@@ -54,7 +54,7 @@ impl IntelCatManager {
         }
 
         // 1. Guard against #GP faults on CPUs without Intel CAT (CPUID Leaf 0x10 Subleaf 1)
-        let cat_supported = unsafe {
+        let cat_supported = {
             let res = core::arch::x86_64::__cpuid_count(0x10, 1);
             (res.ebx & (1 << 1)) != 0
         };
