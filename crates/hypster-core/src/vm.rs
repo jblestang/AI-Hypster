@@ -56,9 +56,9 @@ impl VirtualMachine {
         let entry_point = 0x1000; // GPA 4KB
         let stack_top = 0xF000;   // GPA 60KB stack
 
-        let vcpu0 = Some(VCpu::new(0, entry_point, stack_top));
+        let vcpu0 = Some(VCpu::new(id, 0, entry_point, stack_top));
         let vcpu1 = if vcpu_count > 1 {
-            Some(VCpu::new(1, entry_point + 0x100, stack_top + 0x800))
+            Some(VCpu::new(id, 1, entry_point + 0x100, stack_top + 0x800))
         } else {
             None
         };

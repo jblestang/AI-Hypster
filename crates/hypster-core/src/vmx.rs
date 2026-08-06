@@ -310,6 +310,8 @@ pub struct VCpuRegisters {
 /// Guarantees spatial and temporal isolation across hardware partition cells.
 pub struct VCpu {
     /// TSF security attribute field 
+    pub vm_id: usize,
+    /// TSF security attribute field 
     pub id: usize,
     /// TSF security attribute field 
     pub registers: VCpuRegisters,
@@ -327,26 +329,33 @@ impl VCpu {
     /// Safety: Enforces memory isolation and parameter validation.
     /// Common Criteria EAL5+ TSF Operational Verification:
     /// Enforces non-interference invariants, memory range validation, and register safety.
-    pub fn new(id: usize, entry_point: u64, stack_pointer: u64) -> Self {
+    pub fn new(vm_id: usize, vcpu_id: usize, entry_point: u64, stack_pointer: u64) -> Self {
         let mut regs = VCpuRegisters::default();
         regs.rip = entry_point;
         regs.rsp = stack_pointer;
         regs.rflags = 0x2; // Reserved bit always 1
 
-        let vmcs_ptr = if id == 0 {
+        let vmcs_ptr = if vm_id == 0 {
             core::ptr::addr_of_mut!(VMCS_REGION_1)
         } else {
             core::ptr::addr_of_mut!(VMCS_REGION_2)
         };
 
         Self {
-            id,
+            vm_id,
+            id: vcpu_id,
             registers: regs,
             vmcs_ptr,
             launched: false,
             active: true,
         }
     }
+}
+
+/// Load the vCPU's VMCS region as the current VMCS (required before VMREAD/VMWRITE/VMENTRY).
+pub unsafe fn vmptrld_vmcs(vcpu: &VCpu) {
+    let vmcs_pa = vcpu.vmcs_ptr as u64;
+    asm!("vmptrld [{0}]", in(reg) &vmcs_pa, options(readonly));
 }
 
 // ============================================================================
@@ -587,7 +596,7 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: 
 
     // Non-TRUE adjust forces "use MSR bitmaps" (bit 26) on — point at a zeroed page.
     if (proc_ctls & (1 << 26)) != 0 {
-        let bitmap = if vcpu.id == 0 {
+        let bitmap = if vcpu.vm_id == 0 {
             core::ptr::addr_of_mut!(MSR_BITMAP_1)
         } else {
             core::ptr::addr_of_mut!(MSR_BITMAP_2)
@@ -724,7 +733,7 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: 
     vmwrite(VMCS_HOST_IA32_EFER, read_msr(IA32_EFER_MSR));
 
     serial_print("[HYPSTER-VTX] Hardware VMCS Region Configured for VM ");
-    crate::serial::serial_print_dec(vcpu.id as u64);
+    crate::serial::serial_print_dec(vcpu.vm_id as u64);
     serial_print(" [EPTP: ");
     serial_print_hex(eptp);
     serial_print("]\n");

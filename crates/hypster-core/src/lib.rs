@@ -648,10 +648,16 @@ mod tests {
     }
 
     #[test]
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
+    fn test_vmcs_region_per_vm_id() {
+        let vm0_vcpu0 = vmx::VCpu::new(0, 0, 0x1000, 0xF000);
+        let vm1_vcpu0 = vmx::VCpu::new(1, 0, 0x1000, 0xF000);
+        assert_ne!(vm0_vcpu0.vmcs_ptr, vm1_vcpu0.vmcs_ptr);
+        assert_eq!(vm0_vcpu0.vm_id, 0);
+        assert_eq!(vm1_vcpu0.id, 0);
+        assert_eq!(vm1_vcpu0.vm_id, 1);
+    }
+
+    #[test]
     fn test_scheduler_concurrent_vcpus() {
         let sched = scheduler::StaticScheduler::new();
         let cores = sched.concurrent_vcpus();

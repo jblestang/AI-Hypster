@@ -11,7 +11,7 @@ pub use crate::vmx::VCpu;
 pub use crate::vmx::enable_hardware_vmx;
 
 use crate::vmx::{
-    setup_hardware_vmcs, vmread, vmwrite, VMCS_GUEST_RIP, VMCS_HOST_RIP,
+    setup_hardware_vmcs, vmptrld_vmcs, vmread, vmwrite, VMCS_GUEST_RIP, VMCS_HOST_RIP,
     VMCS_VM_EXIT_INSTRUCTION_LEN, VMCS_VM_EXIT_REASON, VMCS_VM_INSTRUCTION_ERROR,
     VMCS_EXIT_QUALIFICATION,
 };
@@ -87,6 +87,10 @@ core::arch::global_asm!(
     "vmx_do_launch:",
     "vmlaunch",
     "ret",
+    ".global vmx_do_resume",
+    "vmx_do_resume:",
+    "vmresume",
+    "ret",
     rax_slot = sym SAVED_GUEST_RAX,
     rcx_slot = sym SAVED_GUEST_RCX,
 );
@@ -94,6 +98,7 @@ core::arch::global_asm!(
 extern "C" {
     fn vmx_exit_handler();
     fn vmx_do_launch();
+    fn vmx_do_resume();
 }
 
 /// VM-exit loads host RSP from VMCS_HOST_RSP. The exit stub pushes 15 GPRs then
@@ -170,9 +175,9 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
             vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
             true
         } else if exit_reason == 12 {
-            // HLT
+            // HLT — yield to host scheduler (return 0); shutdown uses VMCALL path.
             vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
-            !GUEST_STOP_REQUESTED.load(Ordering::SeqCst)
+            return 0;
         } else if exit_reason == 10 {
             // CPUID — patch guest GPR stack slots before vmresume (see apply_cpuid_patch).
             let (eax, ebx, ecx, edx) = emulate_cpuid(guest_rax, guest_rcx);
@@ -227,6 +232,77 @@ unsafe fn emulate_cpuid(leaf: u64, _subleaf: u64) -> (u32, u32, u32, u32) {
     }
 }
 
+unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64> {
+    ACTIVE_VCPU = vcpu as *mut VCpu;
+    vmwrite(VMCS_HOST_RIP, vmx_exit_handler as *const () as u64);
+
+    let anchor = host_exit_rsp_anchor();
+    let continuation: u64;
+    let mut entry_failed: u64;
+
+    if use_launch {
+        asm!(
+            "lea {cont}, [rip + 2f]",
+            "mov QWORD PTR [{anchor}], {cont}",
+            "mov rdi, {anchor}",
+            "call vmwrite_host_rsp",
+            "call vmx_do_launch",
+            "mov {failed}, 1",
+            "jmp 3f",
+            "2:",
+            "xor {failed}, {failed}",
+            "3:",
+            anchor = in(reg) anchor,
+            cont = out(reg) continuation,
+            failed = out(reg) entry_failed,
+            out("rdi") _,
+        );
+    } else {
+        asm!(
+            "lea {cont}, [rip + 2f]",
+            "mov QWORD PTR [{anchor}], {cont}",
+            "mov rdi, {anchor}",
+            "call vmwrite_host_rsp",
+            "call vmx_do_resume",
+            "mov {failed}, 1",
+            "jmp 3f",
+            "2:",
+            "xor {failed}, {failed}",
+            "3:",
+            anchor = in(reg) anchor,
+            cont = out(reg) continuation,
+            failed = out(reg) entry_failed,
+            out("rdi") _,
+        );
+    }
+
+    if entry_failed != 0 {
+        return Err(vmread(VMCS_VM_INSTRUCTION_ERROR));
+    }
+    Ok(())
+}
+
+/// Run one vCPU time slice: enter guest until HLT yield, shutdown VMCALL, or fatal exit.
+/// Returns `Ok(true)` if guest is still runnable, `Ok(false)` on shutdown, `Err` on VM-entry fail.
+pub unsafe fn run_vcpu_once(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<bool, u64> {
+    GUEST_STOP_REQUESTED.store(false, Ordering::SeqCst);
+
+    vmptrld_vmcs(vcpu);
+
+    if !vcpu.launched {
+        setup_hardware_vmcs(vcpu, ept_pml4_pa, GUEST_CR3_GPA);
+    }
+
+    let use_launch = !vcpu.launched;
+    enter_guest_inner(vcpu, use_launch)?;
+
+    if GUEST_STOP_REQUESTED.load(Ordering::SeqCst) {
+        Ok(false)
+    } else {
+        Ok(true)
+    }
+}
+
 /// Configure VMCS and enter guest mode until shutdown or failure.
 pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64> {
     GUEST_STOP_REQUESTED.store(false, Ordering::SeqCst);
@@ -235,35 +311,10 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
     vcpu.registers.rsp = GUEST_STACK_TOP_GPA;
     vcpu.launched = false;
 
+    vmptrld_vmcs(vcpu);
     setup_hardware_vmcs(vcpu, ept_pml4_pa, GUEST_CR3_GPA);
-    ACTIVE_VCPU = vcpu as *mut VCpu;
-    vmwrite(VMCS_HOST_RIP, vmx_exit_handler as *const () as u64);
 
-    // Dedicated host exit stack: continuation at anchor; VM-exit RSP starts there.
-    let anchor = host_exit_rsp_anchor();
-    let continuation: u64;
-    let mut launch_failed: u64;
-
-    asm!(
-        "lea {cont}, [rip + 2f]",
-        "mov QWORD PTR [{anchor}], {cont}",
-        "mov rdi, {anchor}",
-        "call vmwrite_host_rsp",
-        "call vmx_do_launch",
-        "mov {failed}, 1",
-        "jmp 3f",
-        "2:",
-        "xor {failed}, {failed}",
-        "3:",
-        anchor = in(reg) anchor,
-        cont = out(reg) continuation,
-        failed = out(reg) launch_failed,
-        out("rdi") _,
-    );
-
-    if launch_failed != 0 {
-        return Err(vmread(VMCS_VM_INSTRUCTION_ERROR));
-    }
+    enter_guest_inner(vcpu, true)?;
 
     serial_print("[HYPSTER] enter_guest returned from VM-exit loop\n");
     Ok(vcpu.launched as u64)
