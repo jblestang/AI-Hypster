@@ -521,9 +521,20 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
     vmwrite(VMCS_GUEST_LDTR_AR_BYTES, 0x10000); // Unusable
     vmwrite(VMCS_GUEST_TR_AR_BYTES, 0x8B);      // Busy 32-bit TSS
 
-    vmwrite(VMCS_GUEST_CR0, 0x80000001); // PE | PG
-    vmwrite(VMCS_GUEST_CR3, 0x1000);
-    vmwrite(VMCS_GUEST_CR4, 0x20);       // PAE
+    // 3. Compute guest CR0 and CR4 using hardware IA32_VMX_CR0_FIXED0/FIXED1 MSRs
+    let fixed0_cr0 = unsafe { read_msr(IA32_VMX_CR0_FIXED0_MSR) };
+    let fixed1_cr0 = unsafe { read_msr(IA32_VMX_CR0_FIXED1_MSR) };
+    let fixed0_cr4 = unsafe { read_msr(IA32_VMX_CR4_FIXED0_MSR) };
+    let fixed1_cr4 = unsafe { read_msr(IA32_VMX_CR4_FIXED1_MSR) };
+
+    let guest_cr0 = (0x80000001u64 | fixed0_cr0) & fixed1_cr0; // PE | PG
+    let guest_cr4 = (0x20u64 | fixed0_cr4) & fixed1_cr4;        // PAE
+
+    unsafe {
+        vmwrite(VMCS_GUEST_CR0, guest_cr0);
+        vmwrite(VMCS_GUEST_CR3, 0x1000);
+        vmwrite(VMCS_GUEST_CR4, guest_cr4);
+    }
 
     // 4. Write Host State Fields
     let mut host_cr0: u64;
