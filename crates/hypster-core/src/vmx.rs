@@ -833,34 +833,46 @@ struct HostTss {
 static mut HOST_TSS: HostTss = HostTss { data: [0; 104] };
 static mut HOST_GDT: [u64; 16] = [0; 16];
 
-/// Ensure a non-zero host TR by copying the live GDT and appending a busy 64-bit TSS.
-unsafe fn ensure_host_tss() -> u16 {
+/// AP-local host TSS/GDT — must not share [`HOST_TSS`] with the BSP.
+/// Kept small (same shape as BSP) so linker BSS layout near other VT-x
+/// statics stays stable; post-VM-exit GDTR.limit=0xFFFF is architectural.
+static mut AP_HOST_TSS: HostTss = HostTss { data: [0; 104] };
+static mut AP_HOST_GDT: [u64; 16] = [0; 16];
+
+unsafe fn install_tss_into(
+    gdt: &mut [u64; 16],
+    tss: &mut HostTss,
+    stack_top: u64,
+) -> u16 {
     let mut gdtr = DescriptorTableRegister { limit: 0, base: 0 };
     asm!("sgdt [{}]", in(reg) &mut gdtr, options(nostack));
 
     let old_count = ((gdtr.limit as usize) + 1) / 8;
     let copy_n = core::cmp::min(old_count, 14);
     for i in 0..copy_n {
-        HOST_GDT[i] = *((gdtr.base as *const u64).add(i));
+        gdt[i] = *((gdtr.base as *const u64).add(i));
     }
 
-    let tss_pa = core::ptr::addr_of_mut!(HOST_TSS) as u64;
+    // 64-bit TSS: RSP0 at offset 4 (SDM Vol. 3A Figure 7-11).
+    tss.data = [0; 104];
+    tss.data[4..12].copy_from_slice(&stack_top.to_le_bytes());
+
+    let tss_pa = tss as *mut HostTss as u64;
     let limit = (core::mem::size_of::<HostTss>() - 1) as u64;
-    let typ_busy_tss64: u64 = 0x89; // Present | 64-bit TSS (available); LTR makes it busy
-    // First 8 bytes of 16-byte TSS descriptor
+    let typ_busy_tss64: u64 = 0x89; // Present | available 64-bit TSS; LTR marks busy
     let desc_low = (limit & 0xFFFF)
         | ((tss_pa & 0xFF_FFFF) << 16)
         | (typ_busy_tss64 << 40)
         | (((limit >> 16) & 0xF) << 48)
         | (((tss_pa >> 24) & 0xFF) << 56);
     let desc_high = (tss_pa >> 32) & 0xFFFF_FFFF;
-    HOST_GDT[copy_n] = desc_low;
-    HOST_GDT[copy_n + 1] = desc_high;
+    gdt[copy_n] = desc_low;
+    gdt[copy_n + 1] = desc_high;
 
     let new_limit = ((copy_n + 2) * 8 - 1) as u16;
     let new_gdtr = DescriptorTableRegister {
         limit: new_limit,
-        base: core::ptr::addr_of_mut!(HOST_GDT) as u64,
+        base: gdt.as_mut_ptr() as u64,
     };
     asm!("lgdt [{}]", in(reg) &new_gdtr, options(readonly, nostack));
 
@@ -869,9 +881,27 @@ unsafe fn ensure_host_tss() -> u16 {
     selector
 }
 
+/// Ensure a non-zero host TR by copying the live GDT and appending a busy 64-bit TSS.
+unsafe fn ensure_host_tss() -> u16 {
+    install_tss_into(
+        &mut *core::ptr::addr_of_mut!(HOST_GDT),
+        &mut *core::ptr::addr_of_mut!(HOST_TSS),
+        0,
+    )
+}
+
+/// Install an AP-private GDT+TSS with `RSP0 = stack_top` (call before AP VMXON).
+pub unsafe fn install_ap_host_tss(stack_top: u64) -> u16 {
+    install_tss_into(
+        &mut *core::ptr::addr_of_mut!(AP_HOST_GDT),
+        &mut *core::ptr::addr_of_mut!(AP_HOST_TSS),
+        stack_top,
+    )
+}
+
 /// Leave VMX root on this CPU (e.g. BSP before handing VM2 to an AP).
 pub unsafe fn disable_hardware_vmx() {
-    core::arch::asm!("vmxoff", options(nostack, preserves_flags));
+    asm!("vmxoff", options(nostack, preserves_flags));
 }
 
 // ============================================================================

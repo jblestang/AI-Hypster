@@ -10,11 +10,18 @@ use crate::serial::serial_print;
 
 pub static AP_READY: AtomicBool = AtomicBool::new(false);
 pub static AP_RUN_VM2: AtomicBool = AtomicBool::new(false);
+/// BSP sets this only after MpServices bring-up prints are done and it is
+/// spinning on `AP_VM2_DONE` — avoids nested-KVM races with concurrent UEFI.
+pub static AP_BSP_WAITING: AtomicBool = AtomicBool::new(false);
 pub static AP_VM2_DONE: AtomicBool = AtomicBool::new(false);
 pub static AP_VM2_OK: AtomicBool = AtomicBool::new(false);
 
 static AP_VM2_EPT_PA: AtomicU64 = AtomicU64::new(0);
 static HOST_EXIT_PCPU: AtomicUsize = AtomicUsize::new(0);
+static AP_EXIT_ANCHOR: AtomicU64 = AtomicU64::new(0);
+static AP_EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Continuation address for enter_guest label-2; restored before exit-stub `ret`.
+static AP_ENTER_CONTINUATION: AtomicU64 = AtomicU64::new(0);
 
 /// Optional UEFI hook: start an AP running [`ap_uefi_procedure`].
 ///
@@ -30,30 +37,79 @@ struct DescReg {
     base: u64,
 }
 
-static mut BSP_IDTR: DescReg = DescReg { limit: 0, base: 0 };
-static mut BSP_GDTR: DescReg = DescReg { limit: 0, base: 0 };
+/// Aligned storage so `sgdt`/`sidt`/`lgdt`/`lidt` see a stable 10-byte operand.
+#[repr(C, align(16))]
+struct DescRegSlot {
+    reg: DescReg,
+}
+
+static mut BSP_IDTR: DescRegSlot = DescRegSlot {
+    reg: DescReg { limit: 0, base: 0 },
+};
+static mut BSP_GDTR: DescRegSlot = DescRegSlot {
+    reg: DescReg { limit: 0, base: 0 },
+};
 
 const TRAMPOLINE_HPA: u64 = 0x8000;
 
 #[repr(C, align(4096))]
 struct ApVmxonPage([u8; 4096]);
 
-#[repr(C, align(16))]
-struct ApHostExitStack([u8; 8192]);
+/// Dual AP stacks in one buffer:
+/// - lower 8 KiB: Rust frames while setting up / returning from VMX
+/// - upper 8 KiB: VMCS HOST_RSP exit stack (must not overlap Rust frames)
+#[repr(C, align(4096))]
+struct ApHostStacks([u8; 16384]);
 
 /// AP-local VMXON region (UEFI identity-maps this HPA).
 static mut AP_VMXON_PAGE: ApVmxonPage = ApVmxonPage([0; 4096]);
 
-/// AP host exit stack — not BSS-adjacent to the BSP stack (separate static).
-static mut AP_HOST_EXIT_STACK: ApHostExitStack = ApHostExitStack([0; 8192]);
+static mut AP_HOST_STACKS: ApHostStacks = ApHostStacks([0; 16384]);
 
+const AP_RUST_STACK_TOP: u64 = 8192;
+const AP_EXIT_STACK_TOP: u64 = 16384;
 pub fn host_exit_pcpu() -> usize {
     HOST_EXIT_PCPU.load(Ordering::SeqCst)
 }
 
 pub fn set_host_exit_pcpu(pcpu_id: usize) {
     HOST_EXIT_PCPU.store(pcpu_id.min(1), Ordering::SeqCst);
-    crate::guest_run::set_host_exit_pcpu(pcpu_id);
+}
+
+pub fn ap_exit_anchor() -> u64 {
+    AP_EXIT_ANCHOR.load(Ordering::SeqCst)
+}
+
+pub fn set_ap_exit_anchor(anchor: u64) {
+    AP_EXIT_ANCHOR.store(anchor, Ordering::SeqCst);
+}
+
+pub fn set_ap_enter_continuation(cont: u64) {
+    AP_ENTER_CONTINUATION.store(cont, Ordering::SeqCst);
+}
+
+pub fn ap_enter_continuation() -> u64 {
+    AP_ENTER_CONTINUATION.load(Ordering::SeqCst)
+}
+
+/// On the AP, finish VM2 without returning through the exit-stub/`enter_guest`
+/// epilogue (that path is unreliable once HOST_RSP is on the AP exit stack).
+/// Signals the BSP wait loop and parks the AP. No-op on the BSP.
+#[inline(never)]
+pub unsafe fn ap_maybe_finish_exit() {
+    if host_exit_pcpu() == 0 {
+        return;
+    }
+    AP_VM2_OK.store(true, Ordering::SeqCst);
+    serial_print("[HYPSTER-SMP] AP: VM2 exited cleanly\n");
+    AP_VM2_DONE.store(true, Ordering::SeqCst);
+    loop {
+        core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+    }
+}
+
+pub fn ap_exit_count_inc() -> u64 {
+    AP_EXIT_COUNT.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
 }
 
 pub fn set_ap_vm2_ept(ept_pa: u64) {
@@ -63,30 +119,46 @@ pub fn set_ap_vm2_ept(ept_pa: u64) {
 /// Capture BSP GDTR/IDTR for AP reuse (call from BSP before starting the AP).
 pub fn capture_bsp_descriptors() {
     unsafe {
-        core::arch::asm!("sgdt [{}]", in(reg) core::ptr::addr_of_mut!(BSP_GDTR), options(nostack));
-        core::arch::asm!("sidt [{}]", in(reg) core::ptr::addr_of_mut!(BSP_IDTR), options(nostack));
+        core::arch::asm!(
+            "sgdt [{}]",
+            in(reg) core::ptr::addr_of_mut!(BSP_GDTR.reg),
+            options(nostack)
+        );
+        core::arch::asm!(
+            "sidt [{}]",
+            in(reg) core::ptr::addr_of_mut!(BSP_IDTR.reg),
+            options(nostack)
+        );
     }
     serial_print("[HYPSTER-SMP] captured BSP IDTR base=");
-    crate::serial::serial_print_hex(unsafe { BSP_IDTR.base });
+    crate::serial::serial_print_hex(unsafe { BSP_IDTR.reg.base });
+    serial_print(" limit=");
+    crate::serial::serial_print_hex(unsafe { BSP_IDTR.reg.limit as u64 });
     serial_print("\n");
 }
 
-unsafe fn load_bsp_descriptors_on_ap() {
-    core::arch::asm!("lgdt [{}]", in(reg) core::ptr::addr_of!(BSP_GDTR), options(readonly, nostack));
-    core::arch::asm!("lidt [{}]", in(reg) core::ptr::addr_of!(BSP_IDTR), options(readonly, nostack));
-    serial_print("[HYPSTER-SMP] AP loaded BSP GDTR/IDTR\n");
+unsafe fn load_bsp_idt_on_ap() {
+    // Keep BSP IDT for exception delivery; GDT/TSS are installed separately so
+    // the AP does not share the BSP task state segment.
+    core::arch::asm!(
+        "lidt [{}]",
+        in(reg) core::ptr::addr_of!(BSP_IDTR.reg),
+        options(readonly, nostack)
+    );
+    serial_print("[HYPSTER-SMP] AP loaded BSP IDTR\n");
 }
 
 /// Install AP exit-stack + reset handoff flags. Call from BSP before starting the AP.
 pub fn prepare_ap_context() {
     AP_READY.store(false, Ordering::SeqCst);
     AP_RUN_VM2.store(false, Ordering::SeqCst);
+    AP_BSP_WAITING.store(false, Ordering::SeqCst);
     AP_VM2_DONE.store(false, Ordering::SeqCst);
     AP_VM2_OK.store(false, Ordering::SeqCst);
 
-    let stack_base = core::ptr::addr_of_mut!(AP_HOST_EXIT_STACK) as u64;
-    let anchor = stack_base + 8192 - 8;
-    crate::guest_run::install_ap_exit_stack(anchor);
+    let stack_base = core::ptr::addr_of_mut!(AP_HOST_STACKS) as u64;
+    let anchor = stack_base + AP_EXIT_STACK_TOP - 8;
+    set_ap_exit_anchor(anchor);
     serial_print("[HYPSTER-SMP] AP exit stack anchor=");
     crate::serial::serial_print_hex(anchor);
     serial_print("\n");
@@ -99,13 +171,11 @@ pub extern "efiapi" fn ap_uefi_procedure(_arg: *mut core::ffi::c_void) {
     AP_READY.store(true, Ordering::SeqCst);
     serial_print("[HYPSTER-SMP] ap_uefi_procedure on AP — running VM2\n");
 
-    // Optional barrier if BSP wants to set AP_RUN_VM2 after dispatch.
     let timeout_spins = 50_000_000u64;
     let mut spins = 0u64;
     while !AP_RUN_VM2.load(Ordering::SeqCst) {
         spins += 1;
         if spins >= timeout_spins {
-            // Proceed anyway if EPT was pre-armed (normal Phase 2 path).
             if AP_VM2_EPT_PA.load(Ordering::SeqCst) != 0 {
                 break;
             }
@@ -116,10 +186,44 @@ pub extern "efiapi" fn ap_uefi_procedure(_arg: *mut core::ffi::c_void) {
         core::hint::spin_loop();
     }
 
+    // Wait until BSP has finished MpServices chatter and is in its join loop.
+    spins = 0;
+    while !AP_BSP_WAITING.load(Ordering::SeqCst) {
+        spins += 1;
+        if spins >= timeout_spins {
+            serial_print("[HYPSTER-SMP] AP timed out waiting for AP_BSP_WAITING\n");
+            AP_VM2_DONE.store(true, Ordering::SeqCst);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+
+    // Run VM2 on the dedicated AP stack — MpServices stacks are too small for
+    // VT-x setup + exit handling and have triggered host panics mid-guest I/O.
     unsafe {
-        run_vm2_on_ap();
+        run_on_ap_stack();
     }
     AP_VM2_DONE.store(true, Ordering::SeqCst);
+}
+
+#[no_mangle]
+unsafe extern "C" fn run_vm2_on_ap_cabi() {
+    run_vm2_on_ap();
+}
+
+/// Switch to the AP Rust stack half, run VM2, then restore the MpServices RSP.
+unsafe fn run_on_ap_stack() {
+    let new_rsp = core::ptr::addr_of_mut!(AP_HOST_STACKS) as u64 + AP_RUST_STACK_TOP;
+    core::arch::asm!(
+        "mov rax, rsp",
+        "mov rsp, {new}",
+        "push rax",
+        "call run_vm2_on_ap_cabi",
+        "pop rsp",
+        new = in(reg) new_rsp,
+        out("rax") _,
+        clobber_abi("C"),
+    );
 }
 
 /// Invoke the UEFI-registered AP starter, if any.
@@ -198,14 +302,47 @@ pub fn wait_ap_ready(max_spins: u64) -> bool {
 }
 
 unsafe fn run_vm2_on_ap() {
-    load_bsp_descriptors_on_ap();
+    // enter_guest returns on the VM-exit stack; save our Rust RSP so we can
+    // restore it before returning to `run_on_ap_stack`.
+    let mut saved_rust_rsp: u64;
+    core::arch::asm!("mov {}, rsp", out(reg) saved_rust_rsp, options(nostack));
+
+    // Keep host IRQs masked for the whole AP VT-x window (VM-exit clears IF,
+    // but MpServices may have left IF=1 before we get here).
+    core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+
+    load_bsp_idt_on_ap();
+
+    // Private TSS with RSP0 = AP exit-stack top. HOST_RSP uses the same half
+    // via ap_exit_anchor() (guest_run must not grow BSS next to HOST_EXIT_STACK).
+    let stack_base = core::ptr::addr_of_mut!(AP_HOST_STACKS) as u64;
+    let stack_top = stack_base + AP_EXIT_STACK_TOP;
+    let anchor = stack_top - 8;
+    set_ap_exit_anchor(anchor);
+    set_host_exit_pcpu(1);
+
+    let tr = crate::vmx::install_ap_host_tss(stack_top);
+    serial_print("[HYPSTER-SMP] AP TSS selector=");
+    crate::serial::serial_print_hex(tr as u64);
+    serial_print(" RSP0=");
+    crate::serial::serial_print_hex(stack_top);
+    serial_print("\n");
+
     let vmxon_hpa = core::ptr::addr_of_mut!(AP_VMXON_PAGE) as u64;
     if !crate::vmx::enable_hardware_vmx_at(vmxon_hpa) {
         serial_print("[HYPSTER-SMP] AP VMXON failed — BSP will fallback VM2\n");
+        set_host_exit_pcpu(0);
+        core::arch::asm!("mov rsp, {}", in(reg) saved_rust_rsp, options(nostack));
         return;
     }
     let ept_pa = AP_VM2_EPT_PA.load(Ordering::SeqCst);
     let hv = crate::dual_run::dual_hv_mut();
+    // Drop any posted-interrupt ON bit before VMLAUNCH — nested KVM cannot
+    // emulate the notification self-IPI on this AP.
+    unsafe {
+        crate::pir::GLOBAL_PIR_MANAGER.descriptors[1] =
+            crate::pir::PostedInterruptDescriptor::new();
+    }
     match hv.vcpu_mut(crate::VM2_ID, 0) {
         Ok(vcpu) => match crate::guest_run::enter_guest(vcpu, ept_pa) {
             Ok(_) => {
@@ -220,6 +357,9 @@ unsafe fn run_vm2_on_ap() {
         },
         Err(_) => serial_print("[HYPSTER-SMP] AP: missing VM2 vCPU\n"),
     }
+
+    set_host_exit_pcpu(0);
+    core::arch::asm!("mov rsp, {}", in(reg) saved_rust_rsp, options(nostack));
 }
 
 unsafe fn install_trampoline(entry64: u64, cr3: u64) {

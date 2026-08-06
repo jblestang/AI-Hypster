@@ -103,6 +103,12 @@ impl PostedInterruptManager {
         if cfg!(test) {
             return;
         }
+        // Nested KVM on an MpServices AP cannot emulate posted-interrupt
+        // notification IPIs (KVM internal error / RIP=0xb0000). Skip on AP.
+        if crate::ap_trampoline::host_exit_pcpu() != 0 {
+            serial_print("[HYPSTER-PIR] Skipping posted-interrupt VMCS fields on AP\n");
+            return;
+        }
 
         let desc_ptr = &self.descriptors[vm_id.min(1)] as *const PostedInterruptDescriptor as u64;
         unsafe {

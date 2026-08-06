@@ -124,7 +124,17 @@ pub fn install_ap_exit_stack(_page_hpa: u64) {}
 #[no_mangle]
 extern "C" fn vmwrite_host_rsp(rsp: u64) {
     unsafe {
-        vmwrite(crate::vmx::VMCS_HOST_RSP, rsp);
+        let mut host_rsp = rsp;
+        if crate::ap_trampoline::host_exit_pcpu() != 0 {
+            let a = crate::ap_trampoline::ap_exit_anchor();
+            if a != 0 {
+                let cont = core::ptr::read_volatile(rsp as *const u64);
+                core::ptr::write_volatile(a as *mut u64, cont);
+                crate::ap_trampoline::set_ap_enter_continuation(cont);
+                host_rsp = a;
+            }
+        }
+        vmwrite(crate::vmx::VMCS_HOST_RSP, host_rsp);
     }
 }
 
@@ -146,7 +156,14 @@ extern "C" fn apply_cpuid_patch(gpr_stack: *mut u64) {
 #[no_mangle]
 extern "C" fn reload_host_rsp() {
     unsafe {
-        vmwrite(crate::vmx::VMCS_HOST_RSP, host_exit_rsp_anchor(0));
+        let mut host_rsp = host_exit_rsp_anchor(0);
+        if crate::ap_trampoline::host_exit_pcpu() != 0 {
+            let a = crate::ap_trampoline::ap_exit_anchor();
+            if a != 0 {
+                host_rsp = a;
+            }
+        }
+        vmwrite(crate::vmx::VMCS_HOST_RSP, host_rsp);
     }
 }
 
@@ -179,6 +196,10 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
                     ENTRY_FAILED = 0;
                     vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
                     serial_print("[HYPSTER] Guest shutdown acknowledged\n");
+                    // On AP, bypass exit-stub `ret` (continuation slot is fragile).
+                    unsafe {
+                        crate::ap_trampoline::ap_maybe_finish_exit();
+                    }
                     return 0;
                 }
                 other => {

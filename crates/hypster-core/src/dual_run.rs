@@ -2,8 +2,8 @@
 //! `HYPSTER_SMP` / `cfg(hypster_smp)` is enabled at build time.
 
 use crate::ap_trampoline::{
-    ap_main, bringup_ap, set_ap_vm2_ept, try_uefi_start_ap, AP_READY, AP_RUN_VM2, AP_VM2_DONE,
-    AP_VM2_OK,
+    ap_main, bringup_ap, capture_bsp_descriptors, set_ap_vm2_ept, try_uefi_start_ap, AP_BSP_WAITING,
+    AP_READY, AP_RUN_VM2, AP_VM2_DONE, AP_VM2_OK,
 };
 use crate::guest_boot;
 use crate::guest_run::{enter_guest, GUEST_STOP_REQUESTED};
@@ -52,40 +52,16 @@ pub fn run_dual_partitions(
         hv.load_vm_payload(VM2_ID, vm2_code, guest_boot::GUEST_ENTRY_GPA);
 
         let smp = cfg!(hypster_smp);
-        // Under nested KVM, OVMF MpServices APs cannot host a second VMXON context
-        // reliably. Skip AP VT-x there; bare metal uses UEFI MP or INIT-SIPI.
-        let ap_ready = if smp {
-            if crate::ap_trampoline::is_nested_hypervisor() {
-                serial_print(
-                    "[HYPSTER] Phase 2: nested hypervisor — AP VT-x skipped; sequential VM1→VM2\n",
-                );
-                false
-            } else {
-                serial_print("[HYPSTER] Phase 2: starting AP after payload load\n");
-                set_ap_vm2_ept(hv.ept_pa(VM2_ID));
-                if try_uefi_start_ap() {
-                    serial_print("[HYPSTER] Phase 2: AP started via UEFI MpServices\n");
-                    AP_READY.load(Ordering::SeqCst)
-                        || crate::ap_trampoline::wait_ap_ready(50_000_000)
-                } else {
-                    serial_print("[HYPSTER] Phase 2: attempting INIT-SIPI AP bring-up\n");
-                    bringup_ap(1, ap_main as *const () as usize as u64)
-                }
-            }
-        } else {
-            false
-        };
-
-        if ap_ready {
-            serial_print("[HYPSTER] Phase 2: AP ready — BSP runs VM1, AP runs VM2\n");
-        } else if smp {
+        if smp {
             serial_print(
-                "[HYPSTER] Phase 2 fallback: sequential VM1→VM2 (AP did not check in)\n",
+                "[HYPSTER] Phase 2: BSP runs VM1 first; AP runs VM2 after handoff\n",
             );
         } else {
             serial_print("[HYPSTER] Phase 1: sequential run — VM1 then VM2\n");
         }
 
+        // Always run VM1 on BSP first. Starting an AP before VMLAUNCH reboots
+        // nested KVM; after VM1 the AP can take VM2 alone.
         {
             let ept_pa = hv.ept_pa(VM1_ID);
             let vcpu = hv.vcpu_mut(VM1_ID, 0)?;
@@ -98,34 +74,85 @@ pub fn run_dual_partitions(
         }
 
         {
-            let vec = crate::config::POSTED_INTERRUPT_NOTIFICATION_VECTOR;
-            crate::pir::GLOBAL_PIR_MANAGER.post_vector(1, vec);
-            serial_print("[HYPSTER-PIR] Doorbell posted to VM2 (notification vector)\n");
-        }
-
-        if ap_ready {
-            AP_RUN_VM2.store(true, Ordering::SeqCst);
-            let timeout_cycles = 2_000_000u64.saturating_mul(3000);
-            let start = core::arch::x86_64::_rdtsc();
-            let mut spins = 0u64;
-            while !AP_VM2_DONE.load(Ordering::SeqCst) {
-                spins += 1;
-                if core::arch::x86_64::_rdtsc().saturating_sub(start) > timeout_cycles
-                    || spins > 50_000_000
-                {
-                    break;
+            // Posted-interrupt doorbell uses a local-APIC self-IPI. Under nested
+            // KVM that IPI is emulated on the BSP fine, but on an MpServices AP it
+            // triggers "KVM internal error / emulation failure". Skip when the AP
+            // will run VM2; sequential BSP VM2 still gets the doorbell below.
+            if !(smp && cfg!(hypster_smp)) {
+                let vec = crate::config::POSTED_INTERRUPT_NOTIFICATION_VECTOR;
+                crate::pir::GLOBAL_PIR_MANAGER.post_vector(1, vec);
+                serial_print("[HYPSTER-PIR] Doorbell posted to VM2 (notification vector)\n");
+            } else {
+                // Ensure no stale ON bit from a prior run.
+                unsafe {
+                    crate::pir::GLOBAL_PIR_MANAGER.descriptors[1] =
+                        crate::pir::PostedInterruptDescriptor::new();
                 }
-                core::hint::spin_loop();
+                serial_print("[HYPSTER-PIR] Doorbell skipped for AP VM2 (nested APIC)\n");
             }
-            if AP_VM2_OK.load(Ordering::SeqCst) {
-                serial_print("[HYPSTER] VM2 exited cleanly (AP).\n");
-                finish(hv);
-                return Ok(());
-            }
-            serial_print("[HYPSTER] AP VM2 incomplete — sequential fallback for VM2 on BSP\n");
         }
 
-        {
+        let mut ap_ran_vm2 = false;
+        if smp {
+            unsafe {
+                crate::vmx::disable_hardware_vmx();
+            }
+            serial_print("[HYPSTER] BSP VMXOFF before AP VM2\n");
+            capture_bsp_descriptors();
+            set_ap_vm2_ept(hv.ept_pa(VM2_ID));
+            AP_RUN_VM2.store(true, Ordering::SeqCst);
+
+            let ap_ready = if try_uefi_start_ap() {
+                serial_print("[HYPSTER] Phase 2: AP started via UEFI MpServices (post-VM1)\n");
+                AP_READY.load(Ordering::SeqCst)
+                    || crate::ap_trampoline::wait_ap_ready(50_000_000)
+            } else {
+                serial_print("[HYPSTER] Phase 2: attempting INIT-SIPI AP bring-up\n");
+                bringup_ap(1, ap_main as *const () as usize as u64)
+            };
+
+            if ap_ready {
+                // Release AP to VMLAUNCH only once BSP is past MpServices prints.
+                AP_BSP_WAITING.store(true, Ordering::SeqCst);
+                let timeout_cycles = 2_000_000u64.saturating_mul(5000);
+                let start = core::arch::x86_64::_rdtsc();
+                let mut spins = 0u64;
+                while !AP_VM2_DONE.load(Ordering::SeqCst) {
+                    spins += 1;
+                    if core::arch::x86_64::_rdtsc().saturating_sub(start) > timeout_cycles
+                        || spins > 100_000_000
+                    {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                if AP_VM2_OK.load(Ordering::SeqCst) {
+                    serial_print("[HYPSTER] VM2 exited cleanly (AP).\n");
+                    ap_ran_vm2 = true;
+                } else {
+                    serial_print(
+                        "[HYPSTER] AP VM2 incomplete — sequential fallback for VM2 on BSP\n",
+                    );
+                }
+            } else {
+                serial_print(
+                    "[HYPSTER] Phase 2 fallback: sequential VM2 on BSP (AP did not start)\n",
+                );
+            }
+
+            if !ap_ran_vm2 {
+                let vmx_ok = unsafe { crate::vmx::enable_hardware_vmx() };
+                if !vmx_ok {
+                    serial_print("[HYPSTER] BSP VMXON restore failed after AP path\n");
+                    return Err(0xBEEF);
+                }
+                let vec = crate::config::POSTED_INTERRUPT_NOTIFICATION_VECTOR;
+                crate::pir::GLOBAL_PIR_MANAGER.post_vector(1, vec);
+                serial_print("[HYPSTER-PIR] Doorbell posted to VM2 (BSP fallback)\n");
+            }
+        }
+
+        if !ap_ran_vm2 {
             let ept_pa = hv.ept_pa(VM2_ID);
             let vcpu = hv.vcpu_mut(VM2_ID, 0)?;
             enter_guest(vcpu, ept_pa)?;
