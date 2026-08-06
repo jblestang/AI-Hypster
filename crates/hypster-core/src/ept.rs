@@ -28,6 +28,14 @@
 
 use crate::serial::{serial_print, serial_print_hex};
 
+#[cfg(test)]
+static EPT_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+#[cfg(test)]
+fn ept_test_lock() -> spin::MutexGuard<'static, ()> {
+    EPT_TEST_LOCK.lock()
+}
+
 pub const EPT_READ: u64 = 1 << 0;
 pub const EPT_WRITE: u64 = 1 << 1;
 pub const EPT_EXECUTE: u64 = 1 << 2;
@@ -112,12 +120,27 @@ impl EptManager {
         }
     }
 
+    /// Zero page-table nodes for this VM before rebuilding mappings.
+    fn clear_tables(&mut self) {
+        unsafe {
+            (*self.pml4_ptr).entries = [0; 512];
+            (*self.pdpt_ptr).entries = [0; 512];
+            (*self.pd_ptr).entries = [0; 512];
+            (*self.pt_ptr).entries = [0; 512];
+            (*self.pt2_ptr).entries = [0; 512];
+        }
+    }
+
     /// Construct 4-Level EPT identity/offset mapping for VM physical memory
     /// Executable TSF function  enforcing EAL5+ security policy rules.
     /// Safety: Enforces memory isolation and parameter validation.
     /// Common Criteria EAL5+ TSF Operational Verification:
     /// Enforces non-interference invariants, memory range validation, and register safety.
     pub fn map_region(&mut self, gpa_base: u64, hpa_base: u64, size_bytes: u64) {
+        #[cfg(test)]
+        let _ept_guard = ept_test_lock();
+        self.clear_tables();
+
         let pml4_idx = ((gpa_base >> 39) & 0x1FF) as usize;
         let pdpt_idx = ((gpa_base >> 30) & 0x1FF) as usize;
 
@@ -186,6 +209,11 @@ impl EptManager {
     /// Common Criteria EAL5+ TSF Operational Verification:
     /// Enforces non-interference invariants, memory range validation, and register safety.
     pub fn map_mmio_passthrough(&mut self, gpa: u64, hpa: u64, _size_bytes: u64) {
+        #[cfg(test)]
+        let _ept_guard = ept_test_lock();
+        #[cfg(test)]
+        self.clear_tables();
+
         let pml4_idx = ((gpa >> 39) & 0x1FF) as usize;
         let pdpt_idx = ((gpa >> 30) & 0x1FF) as usize;
         let pd_idx = ((gpa >> 21) & 0x1FF) as usize;
@@ -243,6 +271,9 @@ impl EptManager {
     /// Common Criteria EAL5+ TSF Operational Verification:
     /// Enforces non-interference invariants, memory range validation, and register safety.
     pub fn translate_gpa(&self, gpa: u64) -> Option<u64> {
+        #[cfg(test)]
+        let _ept_guard = ept_test_lock();
+
         let pml4_idx = ((gpa >> 39) & 0x1FF) as usize;
         let pdpt_idx = ((gpa >> 30) & 0x1FF) as usize;
         let pd_idx = ((gpa >> 21) & 0x1FF) as usize;
