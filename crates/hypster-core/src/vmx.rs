@@ -869,6 +869,11 @@ unsafe fn ensure_host_tss() -> u16 {
     selector
 }
 
+/// Leave VMX root on this CPU (e.g. BSP before handing VM2 to an AP).
+pub unsafe fn disable_hardware_vmx() {
+    core::arch::asm!("vmxoff", options(nostack, preserves_flags));
+}
+
 // ============================================================================
 // Assembly VT-x Context Switcher Loop (VMLAUNCH / VMRESUME)
 // ============================================================================

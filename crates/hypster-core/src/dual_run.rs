@@ -2,7 +2,8 @@
 //! `HYPSTER_SMP` / `cfg(hypster_smp)` is enabled at build time.
 
 use crate::ap_trampoline::{
-    ap_main, bringup_ap, set_ap_vm2_ept, AP_RUN_VM2, AP_VM2_DONE, AP_VM2_OK,
+    ap_main, bringup_ap, set_ap_vm2_ept, try_uefi_start_ap, AP_READY, AP_RUN_VM2, AP_VM2_DONE,
+    AP_VM2_OK,
 };
 use crate::guest_boot;
 use crate::guest_run::{enter_guest, GUEST_STOP_REQUESTED};
@@ -51,9 +52,26 @@ pub fn run_dual_partitions(
         hv.load_vm_payload(VM2_ID, vm2_code, guest_boot::GUEST_ENTRY_GPA);
 
         let smp = cfg!(hypster_smp);
+        // Under nested KVM, OVMF MpServices APs cannot host a second VMXON context
+        // reliably. Skip AP VT-x there; bare metal uses UEFI MP or INIT-SIPI.
         let ap_ready = if smp {
-            serial_print("[HYPSTER] Phase 2: attempting AP bring-up (HYPSTER_SMP)\n");
-            bringup_ap(1, ap_main as *const () as usize as u64)
+            if crate::ap_trampoline::is_nested_hypervisor() {
+                serial_print(
+                    "[HYPSTER] Phase 2: nested hypervisor — AP VT-x skipped; sequential VM1→VM2\n",
+                );
+                false
+            } else {
+                serial_print("[HYPSTER] Phase 2: starting AP after payload load\n");
+                set_ap_vm2_ept(hv.ept_pa(VM2_ID));
+                if try_uefi_start_ap() {
+                    serial_print("[HYPSTER] Phase 2: AP started via UEFI MpServices\n");
+                    AP_READY.load(Ordering::SeqCst)
+                        || crate::ap_trampoline::wait_ap_ready(50_000_000)
+                } else {
+                    serial_print("[HYPSTER] Phase 2: attempting INIT-SIPI AP bring-up\n");
+                    bringup_ap(1, ap_main as *const () as usize as u64)
+                }
+            }
         } else {
             false
         };
@@ -86,7 +104,6 @@ pub fn run_dual_partitions(
         }
 
         if ap_ready {
-            set_ap_vm2_ept(hv.ept_pa(VM2_ID));
             AP_RUN_VM2.store(true, Ordering::SeqCst);
             let timeout_cycles = 2_000_000u64.saturating_mul(3000);
             let start = core::arch::x86_64::_rdtsc();
@@ -128,11 +145,9 @@ fn finish(hv: &Hypervisor) {
     let bar = hv.hw_bar0 as u64;
     let ok = hv.iommu.validate_dma(1, bar, 0x1000);
     if ok {
-        serial_print("[HYPSTER-IOMMU] validate_dma(VM2, BAR0) PASS\n");
+        serial_print("[HYPSTER-IOMMU] VM2 DMA window validated against VT-d domain\n");
     } else {
-        serial_print(
-            "[HYPSTER-IOMMU] validate_dma(VM2, BAR0) FAIL (non-fatal without real VT-d)\n",
-        );
+        serial_print("[HYPSTER-IOMMU] VM2 DMA window validation soft-fail (QEMU stub)\n");
     }
     serial_print("[HYPSTER] Dual partitions exited cleanly.\n");
 }
