@@ -27,13 +27,17 @@ partitions:
     pci_device: 4
     pci_function: 0
 
+assigned_pci_devices:
+  egress_nic:
+    name: "Intel e1000 Gigabit Ethernet"
+    vendor_id: 0x8086
+    device_id: 0x100E
+    bar0_base_hpa: 0x0000_0000_C108_0000
+    bar0_size: 0x0000_0000_0002_0000
+
 shared_ipc:
   base_hpa: 0x0000_0001_4041_3000
   size: 0x0000_0000_0000_5000
-
-pci_bar0:
-  base_hpa: 0x0000_0000_C108_0000
-  size: 0x0000_0000_0002_0000
 
 iommu:
   dmar_base_hpa: 0x0000_0000_FED9_0000

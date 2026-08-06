@@ -90,6 +90,15 @@ pub const CAT_L3_CLOS0_MASK: u64 = {cat_clos0_mask};
 
 /// Intel CAT Class of Service 1 (CLOS1) L3 Cache Capacity Bitmask (Upper 8 Ways)
 pub const CAT_L3_CLOS1_MASK: u64 = {cat_clos1_mask};
+
+/// Egress Physical NIC PCI Vendor ID (e.g. 0x8086 for Intel)
+pub const NIC_VENDOR_ID: u16 = {nic_vendor_id};
+
+/// Egress Physical NIC PCI Device ID (e.g. 0x100E for e1000)
+pub const NIC_DEVICE_ID: u16 = {nic_device_id};
+
+/// Human-Readable Egress Physical NIC Model Name
+pub const NIC_DEVICE_NAME: &'static str = {nic_device_name};
 "#,
         magic = kv.get("hypervisor.magic").unwrap_or(&"0x4859505354455201".to_string()),
         version = kv.get("hypervisor.version").unwrap_or(&"1".to_string()),
@@ -100,8 +109,11 @@ pub const CAT_L3_CLOS1_MASK: u64 = {cat_clos1_mask};
         partition_ram_size = kv.get("partitions.partition1.ram_size").unwrap_or(&"0x0000_0000_0020_0000".to_string()),
         shared_ipc_base_hpa = kv.get("shared_ipc.base_hpa").unwrap_or(&"0x0000_0001_4041_3000".to_string()),
         shared_ipc_size = kv.get("shared_ipc.size").unwrap_or(&"0x0000_0000_0000_5000".to_string()),
-        pci_bar0_base_hpa = kv.get("pci_bar0.base_hpa").unwrap_or(&"0x0000_0000_C108_0000".to_string()),
-        pci_bar0_size = kv.get("pci_bar0.size").unwrap_or(&"0x0000_0000_0002_0000".to_string()),
+        pci_bar0_base_hpa = kv.get("assigned_pci_devices.egress_nic.bar0_base_hpa").unwrap_or(&"0x0000_0000_C108_0000".to_string()),
+        pci_bar0_size = kv.get("assigned_pci_devices.egress_nic.bar0_size").unwrap_or(&"0x0000_0000_0002_0000".to_string()),
+        nic_vendor_id = kv.get("assigned_pci_devices.egress_nic.vendor_id").unwrap_or(&"0x8086".to_string()),
+        nic_device_id = kv.get("assigned_pci_devices.egress_nic.device_id").unwrap_or(&"0x100E".to_string()),
+        nic_device_name = kv.get("assigned_pci_devices.egress_nic.name").unwrap_or(&"\"Intel e1000 Gigabit Ethernet\"".to_string()),
         iommu_dmar_base_hpa = kv.get("iommu.dmar_base_hpa").unwrap_or(&"0x0000_0000_FED9_0000".to_string()),
         uart_com1_port = kv.get("uart16550.com1_port").unwrap_or(&"0x03F8".to_string()),
         uart_baud_dll = kv.get("uart16550.baud_dll").unwrap_or(&"0x01".to_string()),
@@ -141,8 +153,8 @@ fn validate_hardware_config(kv: &HashMap<String, String>) {
     let ipc_base = parse_hex_or_dec(kv.get("shared_ipc.base_hpa").unwrap_or(&"0x140413000".to_string()));
     let ipc_size = parse_hex_or_dec(kv.get("shared_ipc.size").unwrap_or(&"0x5000".to_string()));
 
-    let bar0_base = parse_hex_or_dec(kv.get("pci_bar0.base_hpa").unwrap_or(&"0xC1080000".to_string()));
-    let bar0_size = parse_hex_or_dec(kv.get("pci_bar0.size").unwrap_or(&"0x20000".to_string()));
+    let bar0_base = parse_hex_or_dec(kv.get("assigned_pci_devices.egress_nic.bar0_base_hpa").unwrap_or(&"0xC1080000".to_string()));
+    let bar0_size = parse_hex_or_dec(kv.get("assigned_pci_devices.egress_nic.bar0_size").unwrap_or(&"0x20000".to_string()));
 
     // 2. Validate overflow safety
     let (hyp_end, ov1) = hyp_base.overflowing_add(hyp_size);

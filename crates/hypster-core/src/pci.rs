@@ -16,8 +16,8 @@ use crate::serial::serial_print;
 pub const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 pub const PCI_CONFIG_DATA: u16 = 0xCFC;
 
-pub const INTEL_VENDOR_ID: u16 = 0x8086;
-pub const E1000_DEV_ID: u16 = 0x100E;
+pub const INTEL_VENDOR_ID: u16 = crate::config::NIC_VENDOR_ID;
+pub const E1000_DEV_ID: u16 = crate::config::NIC_DEVICE_ID;
 
 #[derive(Debug, Clone, Copy)]
 /// TSF Subsystem Structure  implementing CC EAL5+ security controls.
