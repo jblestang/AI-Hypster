@@ -77,6 +77,28 @@ impl PciBusScanner {
         ((val >> ((offset & 2) * 8)) & 0xFFFF) as u16
     }
 
+    /// Locate PCIe MSI-X Capability structure (Capability ID 0x11) in PCI config space
+    pub fn find_msix_capability(bus: u8, dev: u8, func: u8) -> Option<(u8, u32)> {
+        let status = Self::read_pci_config_u16(bus, dev, func, 0x06);
+        if (status & (1 << 4)) == 0 {
+            return None; // Capabilities list bit not set
+        }
+
+        let mut cap_ptr = (Self::read_pci_config_u32(bus, dev, func, 0x34) & 0xFF) as u8;
+        while cap_ptr != 0 && cap_ptr < 0xFF {
+            let cap_header = Self::read_pci_config_u32(bus, dev, func, cap_ptr);
+            let cap_id = (cap_header & 0xFF) as u8;
+            let next_ptr = ((cap_header >> 8) & 0xFF) as u8;
+
+            if cap_id == 0x11 { // MSI-X Capability ID
+                let table_offset = Self::read_pci_config_u32(bus, dev, func, cap_ptr + 4);
+                return Some((cap_ptr, table_offset));
+            }
+            cap_ptr = next_ptr;
+        }
+        None
+    }
+
     #[allow(dead_code)]
     pub fn read_pci_config_u32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
         let address = ((bus as u32) << 16)
