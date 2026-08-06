@@ -53,6 +53,17 @@ impl IntelCatManager {
             return;
         }
 
+        // 1. Guard against #GP faults on CPUs without Intel CAT (CPUID Leaf 0x10 Subleaf 1)
+        let cat_supported = unsafe {
+            let res = core::arch::x86_64::__cpuid_count(0x10, 1);
+            (res.ebx & (1 << 1)) != 0
+        };
+
+        if !cat_supported {
+            serial_print("[HYPSTER-CAT] Intel CAT (L3 Cache Allocation) unsupported on CPU. Falling back gracefully to shared L3 (No #GP Fault).\n");
+            return;
+        }
+
         let policy = &self.policies[vm_id.min(1)];
         let mask_msr = if policy.clos_id == 0 {
             IA32_L3_MASK_0_MSR
@@ -61,10 +72,10 @@ impl IntelCatManager {
         };
 
         unsafe {
-            // 1. Program hardware L3 Cache Capacity Bitmask (CBM)
+            // 2. Program hardware L3 Cache Capacity Bitmask (CBM)
             crate::vmx::write_msr(mask_msr, policy.l3_cache_mask);
 
-            // 2. Bind physical CPU core to CLOS ID via IA32_PQR_ASSOC MSR
+            // 3. Bind physical CPU core to CLOS ID via IA32_PQR_ASSOC MSR
             let assoc_val = (policy.clos_id as u64) << 32;
             crate::vmx::write_msr(IA32_PQR_ASSOC_MSR, assoc_val);
         }

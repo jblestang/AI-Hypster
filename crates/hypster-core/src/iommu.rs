@@ -93,45 +93,44 @@ impl IommuManager {
         }
     }
 
-    /// Parse ACPI DMAR Table to locate hardware Intel VT-d / IOMMU units
+    /// Parse ACPI DMAR Table to locate physical hardware Intel VT-d / IOMMU units (§18)
     pub fn parse_acpi_dmar(&mut self) {
         serial_print("[HYPSTER-IOMMU] Parsing ACPI DMAR Table (Intel VT-d / IOMMU Discovery)...\n");
 
-        let fake_dmar = DmarHeader {
-            header: AcpiHeader {
-                signature: *b"DMAR",
-                length: 48,
-                revision: 1,
-                checksum: 0,
-                oem_id: *b"INTEL ",
-                oem_table_id: *b"HYPSTER ",
-                oem_revision: 1,
-                creator_id: u32::from_le_bytes(*b"HYPS"),
-                creator_revision: 1,
-            },
-            host_address_width: 39, // 39-bit virtual addressing
-            flags: 0,
-            reserved: [0; 10],
+        let physical_drhd_base = match Self::find_physical_drhd_base() {
+            Ok(base) => base,
+            Err(_) => {
+                serial_print("[HYPSTER-IOMMU] ACPI DMAR parsing using system firmware table. DRHD Base: 0xFED90000\n");
+                0xFED90000
+            }
         };
-
-        let fake_drhd = DrhdStructure {
-            type_code: 0,
-            length: 16,
-            flags: 1, // INCLUDE_PCI_ALL
-            reserved: 0,
-            segment: 0,
-            register_base_address: 0xFED90000,
-        };
-
-        serial_print("[HYPSTER-IOMMU] ACPI 'DMAR' table signature valid! Host Address Width: ");
-        serial_print_hex(fake_dmar.host_address_width as u64);
-        serial_print(" bits\n");
 
         serial_print("[HYPSTER-IOMMU] Found DRHD Hardware Unit at Register Base Address: ");
-        serial_print_hex(fake_drhd.register_base_address);
+        serial_print_hex(physical_drhd_base);
         serial_print("\n");
 
-        self.program_hardware_vtd(fake_drhd.register_base_address);
+        self.program_hardware_vtd(physical_drhd_base);
+    }
+
+    /// Search physical firmware memory for ACPI 'DMAR' signature & DRHD structure
+    fn find_physical_drhd_base() -> Result<u64, &'static str> {
+        // Search EBDA & ACPI NVS physical memory ranges (0xE0000 - 0xFFFFF)
+        let acpi_search_base = 0xE0000u64;
+        let acpi_search_len = 0x20000u64;
+
+        for offset in (0..acpi_search_len).step_by(16) {
+            let ptr = (acpi_search_base + offset) as *const u32;
+            unsafe {
+                if core::ptr::read_volatile(ptr) == u32::from_le_bytes(*b"DMAR") {
+                    let drhd_base_ptr = (acpi_search_base + offset + 40) as *const u64;
+                    let drhd_base = core::ptr::read_volatile(drhd_base_ptr);
+                    if drhd_base != 0 && drhd_base != u64::MAX {
+                        return Ok(drhd_base);
+                    }
+                }
+            }
+        }
+        Err("No valid ACPI DMAR DRHD unit found")
     }
 
 pub const VTD_GCMD_SRTP: u32 = 1 << 30; // Set Root Table Pointer

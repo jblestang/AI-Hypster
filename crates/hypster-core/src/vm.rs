@@ -36,9 +36,14 @@ impl VirtualMachine {
         let mut ept = crate::ept::EptManager::new(id);
         ept.map_region(0x0, mem_base_hpa, ram_bytes);
 
-        // Map Direct Hardware MMIO BAR (Bao/Jailhouse model) directly into Driver Domain EPT (0 VM-Exits!)
+        // Map Direct Hardware MMIO BAR (Bao/Jailhouse model) dynamically into Driver Domain EPT (0 VM-Exits!)
         if id == 1 {
-            let physical_e1000_mmio_bar = 0xC108_0000;
+            let pci_devices = crate::pci::PciBusScanner::scan_all_e1000();
+            let physical_e1000_mmio_bar = if let Some(info) = pci_devices[1] {
+                info.bar0 as u64
+            } else {
+                0xC108_0000
+            };
             ept.map_mmio_passthrough(0x2000_0000, physical_e1000_mmio_bar, 0x200000);
             ept.map_mmio_passthrough(physical_e1000_mmio_bar, physical_e1000_mmio_bar, 0x200000);
         }
