@@ -629,7 +629,8 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: 
     // Non-TRUE capability MSRs report default1 bits as 1 in the low half, so the
     // standard (desired | allowed0) & allowed1 adjust keeps always-on bits set.
     let pin_ctls = adjust_vmx_ctl(0, read_msr(IA32_VMX_PINBASED_CTLS_MSR));
-    let proc_ctls = adjust_vmx_ctl(1 << 31, read_msr(IA32_VMX_PROCBASED_CTLS_MSR));
+    // Bit 7 = HLT exiting (nearly-parallel yield); bit 31 = activate secondary controls.
+    let proc_ctls = adjust_vmx_ctl((1 << 7) | (1 << 31), read_msr(IA32_VMX_PROCBASED_CTLS_MSR));
     let sec_proc_ctls = adjust_vmx_ctl(1 << 1, read_msr(IA32_VMX_PROCBASED_CTLS2_MSR)); // EPT only
     let exit_ctls = adjust_vmx_ctl(1 << 9, read_msr(IA32_VMX_EXIT_CTLS_MSR));
     let entry_ctls = adjust_vmx_ctl((1 << 2) | (1 << 9) | (1 << 15), read_msr(IA32_VMX_ENTRY_CTLS_MSR));

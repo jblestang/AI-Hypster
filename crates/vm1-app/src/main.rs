@@ -8,10 +8,25 @@ const HYPERCALL_GUEST_PUTCHAR: u64 = 0x200;
 const HYPERCALL_GUEST_SHUTDOWN: u64 = 0x201;
 
 const SHARED_IPC_GPA: u64 = 0xFE000000;
+const THROUGHPUT_TARGET_PACKETS: u64 = 10_000;
+const BURST_PER_SLICE: usize = 16;
 
 const MAX_PACKET_LEN: usize = 1518;
 const CHANNEL_QUEUE_CAPACITY: usize = 16;
 const CHANNEL_QUEUE_MASK: usize = CHANNEL_QUEUE_CAPACITY - 1;
+
+/// Target A builds keep the one-shot Hello + ping path (no VM2 consumer).
+const TARGET_IS_A: bool = is_target_mode_a();
+
+const fn is_target_mode_a() -> bool {
+    match option_env!("TARGET_MODE") {
+        Some(mode) => {
+            let b = mode.as_bytes();
+            b.len() == 1 && b[0] == b'A'
+        }
+        None => false,
+    }
+}
 
 #[repr(C, align(64))]
 struct Packet {
@@ -24,7 +39,6 @@ struct CachePadded<T> {
     value: T,
 }
 
-/// Matches host `UnidirectionalChannel` — `name` is a 16-byte `&str` fat pointer.
 #[repr(C, align(64))]
 struct UnidirectionalChannel {
     id: usize,
@@ -69,12 +83,16 @@ fn guest_print(s: &str) {
     }
 }
 
+fn guest_hlt() {
+    unsafe {
+        core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+    }
+}
+
 fn guest_shutdown() -> ! {
     hypercall(HYPERCALL_GUEST_SHUTDOWN, 0);
     loop {
-        unsafe {
-            core::arch::asm!("hlt", options(nomem, nostack));
-        }
+        guest_hlt();
     }
 }
 
@@ -108,10 +126,26 @@ pub extern "C" fn _start() -> ! {
     let msg = b"ping from VM1";
     unsafe {
         let ch = &mut *(SHARED_IPC_GPA as *mut UnidirectionalChannel);
-        if channel_send(ch, msg) {
-            guest_print("VM1 sent IPC ping\n");
+        if TARGET_IS_A {
+            if channel_send(ch, msg) {
+                guest_print("VM1 sent IPC ping\n");
+            } else {
+                guest_print("VM1 IPC send failed (ring full)\n");
+            }
         } else {
-            guest_print("VM1 IPC send failed (ring full)\n");
+            let mut sent: u64 = 0;
+            while sent < THROUGHPUT_TARGET_PACKETS {
+                let mut burst = 0usize;
+                while burst < BURST_PER_SLICE && sent < THROUGHPUT_TARGET_PACKETS {
+                    if !channel_send(ch, msg) {
+                        break;
+                    }
+                    sent += 1;
+                    burst += 1;
+                }
+                guest_hlt();
+            }
+            guest_print("VM1 throughput send complete\n");
         }
     }
 

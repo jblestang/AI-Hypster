@@ -1,21 +1,21 @@
-//! Dual-partition bring-up: sequential VM1→VM2, with optional AP handoff when
-//! `HYPSTER_SMP` / `cfg(hypster_smp)` is enabled at build time.
+//! Dual-partition bring-up with nearly-parallel (alternating) VT-x slices.
+//!
+//! Guests burst on shared IPC and `hlt` to yield. The BSP round-robins
+//! [`run_vcpu_once`] until both shut down after the throughput target.
+//! Concurrent AP VMLAUNCH under nested KVM remains unsupported; SMP builds
+//! use the same alternating path.
 
-use crate::ap_trampoline::{
-    ap_main, bringup_ap, capture_bsp_descriptors, set_ap_vm2_ept, try_uefi_start_ap, AP_BSP_WAITING,
-    AP_READY, AP_RUN_VM2, AP_VM2_DONE, AP_VM2_OK,
-};
 use crate::guest_boot;
-use crate::guest_run::{enter_guest, GUEST_STOP_REQUESTED};
+use crate::guest_run::run_vcpu_once;
 use crate::serial::serial_print;
+use crate::throughput::{self, THROUGHPUT_TARGET_PACKETS};
 use crate::{Hypervisor, VM1_ID, VM2_ID};
 use core::mem::MaybeUninit;
-use core::sync::atomic::Ordering;
 
 static mut DUAL_HV: MaybeUninit<Hypervisor> = MaybeUninit::uninit();
 
 /// # Safety
-/// BSP must have initialized `DUAL_HV`; AP must only touch VM2 while BSP waits.
+/// BSP must have initialized `DUAL_HV`.
 pub unsafe fn dual_hv_mut() -> &'static mut Hypervisor {
     unsafe { DUAL_HV.assume_init_mut() }
 }
@@ -51,117 +51,56 @@ pub fn run_dual_partitions(
         hv.load_vm_payload(VM1_ID, vm1_code, guest_boot::GUEST_ENTRY_GPA);
         hv.load_vm_payload(VM2_ID, vm2_code, guest_boot::GUEST_ENTRY_GPA);
 
-        let smp = cfg!(hypster_smp);
-        if smp {
-            serial_print(
-                "[HYPSTER] Phase 2: BSP runs VM1 first; AP runs VM2 after handoff\n",
-            );
-        } else {
-            serial_print("[HYPSTER] Phase 1: sequential run — VM1 then VM2\n");
-        }
+        serial_print("[HYPSTER] Nearly-parallel: alternating VM1↔VM2 slices (HLT yield)\n");
+        serial_print("[HYPSTER] Throughput target packets=");
+        crate::serial::serial_print_dec(THROUGHPUT_TARGET_PACKETS);
+        serial_print("\n");
 
-        // Always run VM1 on BSP first. Starting an AP before VMLAUNCH reboots
-        // nested KVM; after VM1 the AP can take VM2 alone.
-        {
-            let ept_pa = hv.ept_pa(VM1_ID);
-            let vcpu = hv.vcpu_mut(VM1_ID, 0)?;
-            enter_guest(vcpu, ept_pa)?;
-            if !GUEST_STOP_REQUESTED.load(Ordering::SeqCst) {
-                serial_print("[HYPSTER] VM1 did not shutdown cleanly\n");
-                return Err(0xDEAD);
-            }
-            serial_print("[HYPSTER] VM1 exited cleanly.\n");
-        }
+        let vec = crate::config::POSTED_INTERRUPT_NOTIFICATION_VECTOR;
+        crate::pir::GLOBAL_PIR_MANAGER.post_vector(1, vec);
+        serial_print("[HYPSTER-PIR] Doorbell posted to VM2 (notification vector)\n");
 
-        {
-            // Posted-interrupt doorbell uses a local-APIC self-IPI. Under nested
-            // KVM that IPI is emulated on the BSP fine, but on an MpServices AP it
-            // triggers "KVM internal error / emulation failure". Skip when the AP
-            // will run VM2; sequential BSP VM2 still gets the doorbell below.
-            if !(smp && cfg!(hypster_smp)) {
-                let vec = crate::config::POSTED_INTERRUPT_NOTIFICATION_VECTOR;
-                crate::pir::GLOBAL_PIR_MANAGER.post_vector(1, vec);
-                serial_print("[HYPSTER-PIR] Doorbell posted to VM2 (notification vector)\n");
-            } else {
-                // Ensure no stale ON bit from a prior run.
-                unsafe {
-                    crate::pir::GLOBAL_PIR_MANAGER.descriptors[1] =
-                        crate::pir::PostedInterruptDescriptor::new();
-                }
-                serial_print("[HYPSTER-PIR] Doorbell skipped for AP VM2 (nested APIC)\n");
-            }
-        }
+        let ept1 = hv.ept_pa(VM1_ID);
+        let ept2 = hv.ept_pa(VM2_ID);
 
-        let mut ap_ran_vm2 = false;
-        if smp {
-            unsafe {
-                crate::vmx::disable_hardware_vmx();
-            }
-            serial_print("[HYPSTER] BSP VMXOFF before AP VM2\n");
-            capture_bsp_descriptors();
-            set_ap_vm2_ept(hv.ept_pa(VM2_ID));
-            AP_RUN_VM2.store(true, Ordering::SeqCst);
+        let mut vm1_done = false;
+        let mut vm2_done = false;
+        let mut slices = 0u64;
+        let start_tsc = core::arch::x86_64::_rdtsc();
 
-            let ap_ready = if try_uefi_start_ap() {
-                serial_print("[HYPSTER] Phase 2: AP started via UEFI MpServices (post-VM1)\n");
-                AP_READY.load(Ordering::SeqCst)
-                    || crate::ap_trampoline::wait_ap_ready(50_000_000)
-            } else {
-                serial_print("[HYPSTER] Phase 2: attempting INIT-SIPI AP bring-up\n");
-                bringup_ap(1, ap_main as *const () as usize as u64)
-            };
-
-            if ap_ready {
-                // Release AP to VMLAUNCH only once BSP is past MpServices prints.
-                AP_BSP_WAITING.store(true, Ordering::SeqCst);
-                let timeout_cycles = 2_000_000u64.saturating_mul(5000);
-                let start = core::arch::x86_64::_rdtsc();
-                let mut spins = 0u64;
-                while !AP_VM2_DONE.load(Ordering::SeqCst) {
-                    spins += 1;
-                    if core::arch::x86_64::_rdtsc().saturating_sub(start) > timeout_cycles
-                        || spins > 100_000_000
-                    {
-                        break;
+        while (!vm1_done || !vm2_done) && slices < 50_000_000 {
+            slices += 1;
+            if !vm1_done {
+                let vcpu = hv.vcpu_mut(VM1_ID, 0)?;
+                match run_vcpu_once(vcpu, ept1)? {
+                    true => {}
+                    false => {
+                        serial_print("[HYPSTER] VM1 exited cleanly.\n");
+                        vm1_done = true;
                     }
-                    core::hint::spin_loop();
                 }
-                if AP_VM2_OK.load(Ordering::SeqCst) {
-                    serial_print("[HYPSTER] VM2 exited cleanly (AP).\n");
-                    ap_ran_vm2 = true;
-                } else {
-                    serial_print(
-                        "[HYPSTER] AP VM2 incomplete — sequential fallback for VM2 on BSP\n",
-                    );
-                }
-            } else {
-                serial_print(
-                    "[HYPSTER] Phase 2 fallback: sequential VM2 on BSP (AP did not start)\n",
-                );
             }
-
-            if !ap_ran_vm2 {
-                let vmx_ok = unsafe { crate::vmx::enable_hardware_vmx() };
-                if !vmx_ok {
-                    serial_print("[HYPSTER] BSP VMXON restore failed after AP path\n");
-                    return Err(0xBEEF);
+            if !vm2_done {
+                let vcpu = hv.vcpu_mut(VM2_ID, 0)?;
+                match run_vcpu_once(vcpu, ept2)? {
+                    true => {}
+                    false => {
+                        serial_print("[HYPSTER] VM2 exited cleanly.\n");
+                        vm2_done = true;
+                    }
                 }
-                let vec = crate::config::POSTED_INTERRUPT_NOTIFICATION_VECTOR;
-                crate::pir::GLOBAL_PIR_MANAGER.post_vector(1, vec);
-                serial_print("[HYPSTER-PIR] Doorbell posted to VM2 (BSP fallback)\n");
             }
         }
 
-        if !ap_ran_vm2 {
-            let ept_pa = hv.ept_pa(VM2_ID);
-            let vcpu = hv.vcpu_mut(VM2_ID, 0)?;
-            enter_guest(vcpu, ept_pa)?;
-            if !GUEST_STOP_REQUESTED.load(Ordering::SeqCst) {
-                serial_print("[HYPSTER] VM2 did not shutdown cleanly\n");
-                return Err(0xDEAD);
-            }
-            serial_print("[HYPSTER] VM2 exited cleanly.\n");
+        let end_tsc = core::arch::x86_64::_rdtsc();
+
+        if !vm1_done || !vm2_done {
+            serial_print("[HYPSTER] Throughput run incomplete (guest(s) still live)\n");
+            return Err(0xDEAD);
         }
+
+        let stats = throughput::stats_from_tsc(THROUGHPUT_TARGET_PACKETS, start_tsc, end_tsc);
+        throughput::print_stats(&stats);
 
         finish(hv);
         Ok(())

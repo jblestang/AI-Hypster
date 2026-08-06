@@ -7,9 +7,14 @@ SMP="${SMP:-1}"
 echo "=== Building Hypster Target ${TARGET_MODE}: guest(s) + UEFI loader (smp=${SMP}) ==="
 rustup target add x86_64-unknown-none x86_64-unknown-uefi 2>/dev/null || true
 
+# Guests and UEFI both read TARGET_MODE via option_env! (A = one-shot VM1).
+export TARGET_MODE
+
 # Absolute linker script path — relative -Tlinker.ld breaks when cargo is
 # invoked from the workspace root rather than crates/vm1-app.
 export RUSTFLAGS="-C link-arg=-T${PWD}/crates/vm1-app/linker.ld"
+# Force rebuild when TARGET_MODE flips (option_env! is bake-time).
+touch crates/vm1-app/src/main.rs crates/vm2-app/src/main.rs
 cargo build --target x86_64-unknown-none --release -p vm1-app
 objcopy -O binary target/x86_64-unknown-none/release/vm1-app target/x86_64-unknown-none/release/vm1-app.bin
 
@@ -18,7 +23,6 @@ cargo build --target x86_64-unknown-none --release -p vm2-app
 objcopy -O binary target/x86_64-unknown-none/release/vm2-app target/x86_64-unknown-none/release/vm2-app.bin
 
 unset RUSTFLAGS
-export TARGET_MODE
 
 # Phase 2: compile-time gate for AP trampoline (build.rs emits cfg hypster_smp).
 if [ "$SMP" -ge 2 ]; then

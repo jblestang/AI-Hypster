@@ -68,8 +68,24 @@ static mut AP_HOST_STACKS: ApHostStacks = ApHostStacks([0; 16384]);
 
 const AP_RUST_STACK_TOP: u64 = 8192;
 const AP_EXIT_STACK_TOP: u64 = 16384;
+/// Prefer RSP-based identity when on the AP stacks; otherwise the explicit
+/// `HOST_EXIT_PCPU` latch (set before AP `enter_guest`).
+#[inline(always)]
+pub fn current_pcpu() -> usize {
+    let rsp: u64;
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, nomem, preserves_flags));
+    }
+    let base = core::ptr::addr_of!(AP_HOST_STACKS) as u64;
+    if rsp >= base && rsp < base + core::mem::size_of::<ApHostStacks>() as u64 {
+        1
+    } else {
+        HOST_EXIT_PCPU.load(Ordering::Relaxed).min(1)
+    }
+}
+
 pub fn host_exit_pcpu() -> usize {
-    HOST_EXIT_PCPU.load(Ordering::SeqCst)
+    current_pcpu()
 }
 
 pub fn set_host_exit_pcpu(pcpu_id: usize) {
@@ -97,7 +113,7 @@ pub fn ap_enter_continuation() -> u64 {
 /// Signals the BSP wait loop and parks the AP. No-op on the BSP.
 #[inline(never)]
 pub unsafe fn ap_maybe_finish_exit() {
-    if host_exit_pcpu() == 0 {
+    if current_pcpu() == 0 {
         return;
     }
     AP_VM2_OK.store(true, Ordering::SeqCst);
@@ -165,7 +181,7 @@ pub fn prepare_ap_context() {
 }
 
 /// UEFI `MpServices` AP entry. Expects [`set_ap_vm2_ept`] already called; runs VM2
-/// immediately (BSP starts the AP only after VM1 has exited).
+/// after BSP has finished VM1 and set `AP_BSP_WAITING`.
 pub extern "efiapi" fn ap_uefi_procedure(_arg: *mut core::ffi::c_void) {
     set_host_exit_pcpu(1);
     AP_READY.store(true, Ordering::SeqCst);

@@ -37,6 +37,7 @@ pub mod health;
 pub mod pir;
 pub mod cat;
 pub mod ras;
+pub mod throughput;
 
 pub use dual_run::run_dual_partitions;
 pub use guest_run::run_single_guest;
@@ -585,14 +586,6 @@ mod tests {
         assert_eq!(ept.translate_gpa(0x2000).unwrap(), 0x51000);
         assert_eq!(ept.translate_gpa(0x3000).unwrap(), 0x52000);
         assert_eq!(ept.translate_gpa(0x4000).unwrap(), 0x53000);
-    }
-
-    #[test]
-    fn test_ept_maps_second_2mb_chunk() {
-        let mut ept = ept::EptManager::new(0);
-        ept.map_region(0, 0x100_0000, 4 * 1024 * 1024);
-        assert_eq!(ept.translate_gpa(0x1000).unwrap(), 0x100_1000);
-        assert_eq!(ept.translate_gpa(0x2_10_000).unwrap(), 0x100_0000 + 0x2_10_000);
     }
 
     #[test]

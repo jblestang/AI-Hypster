@@ -47,7 +47,8 @@ static mut SHARED_IPC_BUF: AlignedIpcBuffer = AlignedIpcBuffer([0; 0xD000]);
 /// Park an AP on [`hypster_core::ap_trampoline::ap_uefi_procedure`] via non-blocking
 /// `MpServices::startup_this_ap`. Nested KVM/OVMF cannot use INIT-SIPI safely.
 ///
-/// Called from dual-run **after VM1** so the AP is not live during BSP VMLAUNCH.
+/// Called from dual-run **after VM1 + VMXOFF** — a live AP during BSP `VMLAUNCH`
+/// causes host `#PF` under nested KVM.
 extern "C" fn start_ap_via_mp_services() -> bool {
     if !HYPSTER_SMP {
         return false;
@@ -55,7 +56,7 @@ extern "C" fn start_ap_via_mp_services() -> bool {
 
     serial_print("[UEFI-LOADER] Phase 2: starting AP via MpServices (post-VM1)\n");
     hypster_core::ap_trampoline::prepare_ap_context();
-    // BSP already armed AP_RUN_VM2 before invoking this hook.
+    // BSP arms AP_RUN_VM2 before invoking this hook; re-assert after prepare.
     hypster_core::ap_trampoline::AP_RUN_VM2.store(true, core::sync::atomic::Ordering::SeqCst);
 
     let handle = match boot::get_handle_for_protocol::<MpServices>() {

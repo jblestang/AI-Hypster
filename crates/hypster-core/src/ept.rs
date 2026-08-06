@@ -146,6 +146,10 @@ impl EptManager {
     pub fn map_region(&mut self, gpa_base: u64, hpa_base: u64, size_bytes: u64) {
         #[cfg(test)]
         let _ept_guard = ept_test_lock();
+        self.map_region_unlocked(gpa_base, hpa_base, size_bytes);
+    }
+
+    fn map_region_unlocked(&mut self, gpa_base: u64, hpa_base: u64, size_bytes: u64) {
         self.clear_tables();
 
         let pml4_idx = ((gpa_base >> 39) & 0x1FF) as usize;
@@ -328,7 +332,10 @@ impl EptManager {
     pub fn translate_gpa(&self, gpa: u64) -> Option<u64> {
         #[cfg(test)]
         let _ept_guard = ept_test_lock();
+        self.translate_gpa_unlocked(gpa)
+    }
 
+    fn translate_gpa_unlocked(&self, gpa: u64) -> Option<u64> {
         let pml4_idx = ((gpa >> 39) & 0x1FF) as usize;
         let pdpt_idx = ((gpa >> 30) & 0x1FF) as usize;
         let pd_idx = ((gpa >> 21) & 0x1FF) as usize;
@@ -395,9 +402,22 @@ mod tests {
 
     #[test]
     fn map_region_from_zero_translates_page_tables() {
+        let _guard = ept_test_lock();
         let mut ept = EptManager::new(1);
-        ept.map_region(0x0, 0x1DE8A000, 0x400000);
-        assert_eq!(ept.translate_gpa(0x8000).unwrap(), 0x1DE8A000 + 0x8000);
+        ept.map_region_unlocked(0x0, 0x1DE8A000, 0x400000);
+        assert_eq!(ept.translate_gpa_unlocked(0x8000).unwrap(), 0x1DE8A000 + 0x8000);
+    }
+
+    #[test]
+    fn maps_second_2mb_chunk() {
+        let _guard = ept_test_lock();
+        let mut ept = EptManager::new(0);
+        ept.map_region_unlocked(0, 0x100_0000, 4 * 1024 * 1024);
+        assert_eq!(ept.translate_gpa_unlocked(0x1000).unwrap(), 0x100_1000);
+        assert_eq!(
+            ept.translate_gpa_unlocked(0x2_10_000).unwrap(),
+            0x100_0000 + 0x2_10_000
+        );
     }
 
     #[test]

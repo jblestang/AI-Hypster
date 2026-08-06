@@ -25,6 +25,30 @@ static mut SAVED_GUEST_RCX: u64 = 0;
 static CPUID_PATCH_PENDING: AtomicBool = AtomicBool::new(false);
 static mut CPUID_GPR: [u64; 4] = [0; 4]; // rax, rbx, rcx, rdx
 
+/// Host GPRs/RSP saved before VMLAUNCH/VMRESUME. VM-exit leaves guest values in
+/// GPRs and switches to the exit stack; HLT/shutdown yield must restore these
+/// before returning to Rust (needed for alternating `run_vcpu_once`).
+#[repr(C)]
+struct HostYieldSave {
+    rsp: u64,
+    rbp: u64,
+    rbx: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+static mut HOST_YIELD_SAVE: HostYieldSave = HostYieldSave {
+    rsp: 0,
+    rbp: 0,
+    rbx: 0,
+    r12: 0,
+    r13: 0,
+    r14: 0,
+    r15: 0,
+};
+
 /// 8 KiB exit stack: HOST_RSP at the top. After VM-exit `ret`, RSP lands at
 /// `base+8192` and subsequent host frames grow downward through this buffer
 /// (avoids clobbering BSS neighbors — see Task 10).
@@ -85,9 +109,19 @@ core::arch::global_asm!(
     "pop r15",
     "vmresume",
     "ud2",
+    // Yield/shutdown: discard guest GPRs, restore host callee-saved + Rust RSP,
+    // then jump to the enter continuation (do not `ret` on the exit stack).
     "1:",
     "add rsp, 15*8",
-    "ret",
+    "mov rax, qword ptr [rsp]",
+    "mov rsp, qword ptr [{ysave}]",
+    "mov rbp, qword ptr [{ysave} + 8]",
+    "mov rbx, qword ptr [{ysave} + 16]",
+    "mov r12, qword ptr [{ysave} + 24]",
+    "mov r13, qword ptr [{ysave} + 32]",
+    "mov r14, qword ptr [{ysave} + 40]",
+    "mov r15, qword ptr [{ysave} + 48]",
+    "jmp rax",
     ".global vmx_do_launch",
     "vmx_do_launch:",
     "vmlaunch",
@@ -98,6 +132,7 @@ core::arch::global_asm!(
     "ret",
     rax_slot = sym SAVED_GUEST_RAX,
     rcx_slot = sym SAVED_GUEST_RCX,
+    ysave = sym HOST_YIELD_SAVE,
 );
 
 extern "C" {
@@ -282,6 +317,13 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
 
     if use_launch {
         asm!(
+            "mov qword ptr [{ysave}], rsp",
+            "mov qword ptr [{ysave} + 8], rbp",
+            "mov qword ptr [{ysave} + 16], rbx",
+            "mov qword ptr [{ysave} + 24], r12",
+            "mov qword ptr [{ysave} + 32], r13",
+            "mov qword ptr [{ysave} + 40], r14",
+            "mov qword ptr [{ysave} + 48], r15",
             "lea {cont}, [rip + 2f]",
             "mov QWORD PTR [{anchor}], {cont}",
             "mov rdi, {anchor}",
@@ -295,10 +337,28 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
             anchor = in(reg) anchor,
             cont = out(reg) continuation,
             fail_slot = sym ENTRY_FAILED,
+            ysave = sym HOST_YIELD_SAVE,
+            // VM-exit leaves guest values in caller-saved GPRs; yield restores
+            // only callee-saved + RSP. Tell rustc the volatiles are gone.
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+            out("rsi") _,
             out("rdi") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
         );
     } else {
         asm!(
+            "mov qword ptr [{ysave}], rsp",
+            "mov qword ptr [{ysave} + 8], rbp",
+            "mov qword ptr [{ysave} + 16], rbx",
+            "mov qword ptr [{ysave} + 24], r12",
+            "mov qword ptr [{ysave} + 32], r13",
+            "mov qword ptr [{ysave} + 40], r14",
+            "mov qword ptr [{ysave} + 48], r15",
             "lea {cont}, [rip + 2f]",
             "mov QWORD PTR [{anchor}], {cont}",
             "mov rdi, {anchor}",
@@ -312,7 +372,16 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
             anchor = in(reg) anchor,
             cont = out(reg) continuation,
             fail_slot = sym ENTRY_FAILED,
+            ysave = sym HOST_YIELD_SAVE,
+            out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
+            out("rsi") _,
             out("rdi") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
         );
     }
 
@@ -327,12 +396,11 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
 pub unsafe fn run_vcpu_once(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<bool, u64> {
     GUEST_STOP_REQUESTED.store(false, Ordering::SeqCst);
 
-    vcpu.registers.rip = GUEST_ENTRY_GPA;
-    vcpu.registers.rsp = GUEST_STACK_TOP_GPA;
-
     vmptrld_vmcs(vcpu);
 
     if !vcpu.launched {
+        vcpu.registers.rip = GUEST_ENTRY_GPA;
+        vcpu.registers.rsp = GUEST_STACK_TOP_GPA;
         setup_hardware_vmcs(vcpu, ept_pml4_pa, GUEST_CR3_GPA);
     }
 
@@ -364,6 +432,13 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
     ENTRY_FAILED = 0xFFFF_FFFF_FFFF_FFFF;
 
     asm!(
+        "mov qword ptr [{ysave}], rsp",
+        "mov qword ptr [{ysave} + 8], rbp",
+        "mov qword ptr [{ysave} + 16], rbx",
+        "mov qword ptr [{ysave} + 24], r12",
+        "mov qword ptr [{ysave} + 32], r13",
+        "mov qword ptr [{ysave} + 40], r14",
+        "mov qword ptr [{ysave} + 48], r15",
         "lea {cont}, [rip + 2f]",
         "mov QWORD PTR [{anchor}], {cont}",
         "mov rdi, {anchor}",
@@ -377,7 +452,16 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
         anchor = in(reg) anchor,
         cont = out(reg) continuation,
         fail_slot = sym ENTRY_FAILED,
+        ysave = sym HOST_YIELD_SAVE,
+        out("rax") _,
+        out("rcx") _,
+        out("rdx") _,
+        out("rsi") _,
         out("rdi") _,
+        out("r8") _,
+        out("r9") _,
+        out("r10") _,
+        out("r11") _,
     );
 
     let launch_failed = ENTRY_FAILED;
