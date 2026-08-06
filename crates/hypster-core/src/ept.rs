@@ -208,6 +208,7 @@ impl EptManager {
 
         serial_print("[HYPSTER-EPT] EPT 4-Level Page Table constructed for GPA ");
         serial_print_hex(gpa_base);
+        serial_print("\n");
     }
 
     /// Map a shared host physical region into the guest EPT at `gpa_base` using 4 KiB leaves.
@@ -253,6 +254,7 @@ impl EptManager {
 
         serial_print("[HYPSTER-EPT] Shared IPC region mapped at GPA ");
         serial_print_hex(gpa_base);
+        serial_print("\n");
     }
 
     /// Map physical device MMIO region (e.g. e1000 BAR0 0xC10A0000) directly into guest EPT page table (§18 & §19)
@@ -282,6 +284,8 @@ impl EptManager {
             let pdpt_hpa = pdpt as *const EptPageTable as u64;
             pml4.entries[pml4_idx] = pdpt_hpa | EPT_READ | EPT_WRITE | EPT_EXECUTE;
 
+            // Keep the RAM PD table linked at pdpt[pdpt_idx]; MMIO uses a distinct pd entry
+            // (e.g. pd[256] for GPA 0x2000_0000) so pd[0] can remain the low-RAM PT pointer.
             let pd_hpa = pd as *const EptPageTable as u64;
             pdpt.entries[pdpt_idx] = pd_hpa | EPT_READ | EPT_WRITE | EPT_EXECUTE;
 
@@ -389,6 +393,30 @@ impl EptManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_region_from_zero_translates_page_tables() {
+        let mut ept = EptManager::new(1);
+        ept.map_region(0x0, 0x1DE8A000, 0x400000);
+        assert_eq!(ept.translate_gpa(0x8000).unwrap(), 0x1DE8A000 + 0x8000);
+    }
+
+    #[test]
+    fn mmio_passthrough_preserves_low_ram() {
+        let mut ept = EptManager::new(1);
+        ept.map_region(0x0, 0x1DE8A000, 0x400000);
+        assert!(ept.translate_gpa(0x8000).is_some());
+        ept.map_mmio_passthrough(0x2000_0000, 0xC108_0000, 0x200000);
+        unsafe {
+            let pdpt = &*ept.pdpt_ptr;
+            let pd = &*ept.pd_ptr;
+            let ram_pd_pa = ept.pd_ptr as u64 & 0x000F_FFFF_FFFF_F000;
+            assert_eq!(pdpt.entries[0] & 0x000F_FFFF_FFFF_F000, ram_pd_pa);
+            assert_eq!(pd.entries[0] & EPT_PAGE_SIZE_2MB, 0);
+        }
+        assert_eq!(ept.translate_gpa(0x8000).unwrap(), 0x1DE8A000 + 0x8000);
+        assert!(ept.translate_gpa(0x2000_0000).is_some());
+    }
 
     #[test]
     fn map_shared_ipc_region_at_guest_gpa() {

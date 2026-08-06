@@ -118,14 +118,19 @@ impl LocalApicDriver {
     /// Enforces non-interference invariants, memory range validation, and register safety.
     fn delay_us(us: u64) {
         if cfg!(test) {
-        // Verify security policy condition bounds
             return;
         }
-        let cpu_freq_mhz = 3000u64; // 3.0 GHz baseline
-        let target_cycles = us * cpu_freq_mhz;
+        let cpu_freq_mhz = 3000u64;
+        let target_cycles = us.saturating_mul(cpu_freq_mhz);
         let start = unsafe { core::arch::x86_64::_rdtsc() };
-        // Polling loop with bounded execution guarantee
+        // Also bound by spin count — nested KVM may present a frozen/slow TSC.
+        let max_spins = us.saturating_mul(10_000).max(1_000);
+        let mut spins = 0u64;
         while unsafe { core::arch::x86_64::_rdtsc() }.saturating_sub(start) < target_cycles {
+            spins += 1;
+            if spins >= max_spins {
+                break;
+            }
             core::hint::spin_loop();
         }
     }

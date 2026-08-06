@@ -243,17 +243,11 @@ static mut VMXON_REGION: VmxonRegion = VmxonRegion {
     data: [0; 4092],
 };
 
-static mut VMCS_REGION_1: VmcsRegion = VmcsRegion {
-    revision_id: 0,
-    abort_indicator: 0,
-    data: [0; 4088],
-};
-
-static mut VMCS_REGION_2: VmcsRegion = VmcsRegion {
-    revision_id: 0,
-    abort_indicator: 0,
-    data: [0; 4088],
-};
+/// Per-partition VMCS regions (index by `vm_id`).
+static mut VMCS_REGIONS: [VmcsRegion; 2] = [
+    VmcsRegion { revision_id: 0, abort_indicator: 0, data: [0; 4088] },
+    VmcsRegion { revision_id: 0, abort_indicator: 0, data: [0; 4088] },
+];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -335,11 +329,7 @@ impl VCpu {
         regs.rsp = stack_pointer;
         regs.rflags = 0x2; // Reserved bit always 1
 
-        let vmcs_ptr = if vm_id == 0 {
-            core::ptr::addr_of_mut!(VMCS_REGION_1)
-        } else {
-            core::ptr::addr_of_mut!(VMCS_REGION_2)
-        };
+        let vmcs_ptr = unsafe { core::ptr::addr_of_mut!(VMCS_REGIONS[vm_id.min(1)]) };
 
         Self {
             vm_id,
@@ -566,6 +556,62 @@ pub unsafe fn enable_hardware_vmx() -> bool {
     true
 }
 
+/// VMXON on the calling logical processor using a caller-supplied 4 KiB region HPA.
+/// Used by the AP so it does not share the BSP [`VMXON_REGION`].
+pub unsafe fn enable_hardware_vmx_at(vmxon_hpa: u64) -> bool {
+    if !vmx_supported() {
+        return false;
+    }
+
+    let mut cr4: u64;
+    asm!("mov {}, cr4", out(reg) cr4);
+    let cr4_fixed0 = read_msr(IA32_VMX_CR4_FIXED0_MSR);
+    let cr4_fixed1 = read_msr(IA32_VMX_CR4_FIXED1_MSR);
+    cr4 |= 1 << 13;
+    cr4 |= cr4_fixed0;
+    cr4 &= cr4_fixed1;
+    asm!("mov cr4, {}", in(reg) cr4);
+
+    let mut cr0: u64;
+    asm!("mov {}, cr0", out(reg) cr0);
+    let cr0_fixed0 = read_msr(IA32_VMX_CR0_FIXED0_MSR);
+    let cr0_fixed1 = read_msr(IA32_VMX_CR0_FIXED1_MSR);
+    cr0 |= cr0_fixed0;
+    cr0 &= cr0_fixed1;
+    asm!("mov cr0, {}", in(reg) cr0);
+
+    let feat = read_msr(IA32_FEATURE_CONTROL_MSR);
+    if (feat & 1) == 0 {
+        write_msr(IA32_FEATURE_CONTROL_MSR, feat | 1 | (1 << 2));
+    }
+
+    let basic_msr = read_msr(IA32_VMX_BASIC_MSR);
+    let rev_id = (basic_msr & 0x7FFFFFFF) as u32;
+    let vmxon_ptr = vmxon_hpa as *mut VmxonRegion;
+    core::ptr::write_bytes(vmxon_ptr as *mut u8, 0, 4096);
+    (*vmxon_ptr).revision_id = rev_id;
+
+    let vmxon_pa = vmxon_hpa;
+    let mut rflags: u64;
+    asm!(
+        "vmxon [{0}]",
+        "pushfq",
+        "pop {1}",
+        in(reg) &vmxon_pa,
+        out(reg) rflags,
+        options(nostack)
+    );
+
+    let cf = (rflags & 1) != 0;
+    let zf = (rflags & 0x40) != 0;
+    if cf || zf {
+        serial_print("[HYPSTER-VTX] AP VMXON failed\n");
+        return false;
+    }
+    serial_print("[HYPSTER-VTX] AP VMXON ok\n");
+    true
+}
+
 /// Setup VMCS Fields for Hardware Guest Execution
 pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: u64) {
     let basic_msr = read_msr(IA32_VMX_BASIC_MSR);
@@ -737,6 +783,11 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: 
     serial_print(" [EPTP: ");
     serial_print_hex(eptp);
     serial_print("]\n");
+
+    // SAFETY: PIR manager is process-global; VMCS is current after VMPTRLD above.
+    unsafe {
+        crate::pir::GLOBAL_PIR_MANAGER.configure_vmcs(vcpu.vm_id);
+    }
 }
 
 #[inline(always)]

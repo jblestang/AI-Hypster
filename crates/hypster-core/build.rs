@@ -10,6 +10,11 @@ use std::collections::HashMap;
 
 fn main() {
     println!("cargo:rerun-if-changed=hardware_config.yaml");
+    println!("cargo:rerun-if-env-changed=HYPSTER_SMP");
+    println!("cargo:rustc-check-cfg=cfg(hypster_smp)");
+    if std::env::var_os("HYPSTER_SMP").is_some() {
+        println!("cargo:rustc-cfg=hypster_smp");
+    }
 
     let yaml_content = fs::read_to_string("hardware_config.yaml")
         .expect("Failed to read hardware_config.yaml file!");
@@ -99,6 +104,24 @@ pub const NIC_DEVICE_ID: u16 = {nic_device_id};
 
 /// Human-Readable Egress Physical NIC Model Name
 pub const NIC_DEVICE_NAME: &'static str = {nic_device_name};
+
+/// Partition 1 assigned PCI Bus
+pub const VM1_PCI_BUS: u8 = {vm1_pci_bus};
+
+/// Partition 1 assigned PCI Device
+pub const VM1_PCI_DEVICE: u8 = {vm1_pci_device};
+
+/// Partition 1 assigned PCI Function
+pub const VM1_PCI_FUNCTION: u8 = {vm1_pci_function};
+
+/// Partition 2 assigned PCI Bus
+pub const VM2_PCI_BUS: u8 = {vm2_pci_bus};
+
+/// Partition 2 assigned PCI Device
+pub const VM2_PCI_DEVICE: u8 = {vm2_pci_device};
+
+/// Partition 2 assigned PCI Function
+pub const VM2_PCI_FUNCTION: u8 = {vm2_pci_function};
 "#,
         magic = kv.get("hypervisor.magic").unwrap_or(&"0x4859505354455201".to_string()),
         version = kv.get("hypervisor.version").unwrap_or(&"1".to_string()),
@@ -125,6 +148,12 @@ pub const NIC_DEVICE_NAME: &'static str = {nic_device_name};
         pir_notification_vector = kv.get("posted_interrupts.notification_vector").unwrap_or(&"0xF2".to_string()),
         cat_clos0_mask = kv.get("cat_l3.clos0_mask").unwrap_or(&"0x00FF".to_string()),
         cat_clos1_mask = kv.get("cat_l3.clos1_mask").unwrap_or(&"0xFF00".to_string()),
+        vm1_pci_bus = kv.get("partitions.partition1.pci_bus").unwrap_or(&"0".to_string()),
+        vm1_pci_device = kv.get("partitions.partition1.pci_device").unwrap_or(&"3".to_string()),
+        vm1_pci_function = kv.get("partitions.partition1.pci_function").unwrap_or(&"0".to_string()),
+        vm2_pci_bus = kv.get("partitions.partition2.pci_bus").unwrap_or(&"0".to_string()),
+        vm2_pci_device = kv.get("partitions.partition2.pci_device").unwrap_or(&"4".to_string()),
+        vm2_pci_function = kv.get("partitions.partition2.pci_function").unwrap_or(&"0".to_string()),
     );
 
     fs::write(dest_path, generated_code).expect("Failed to write generated hardware_constants.rs!");

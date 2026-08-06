@@ -85,7 +85,11 @@ impl StaticHypervisorConfig {
                     guest_phys_base: VM1_RAM_BASE_HPA,
                     guest_phys_size: PARTITION_RAM_SIZE,
                     pcpu_affinity: 0,
-                    assigned_pci_bdf: (0, 3, 0),
+                    assigned_pci_bdf: (
+                        VM1_PCI_BUS,
+                        VM1_PCI_DEVICE,
+                        VM1_PCI_FUNCTION,
+                    ),
                 },
                 StaticPartitionConfig {
                     vm_id: 1,
@@ -93,7 +97,11 @@ impl StaticHypervisorConfig {
                     guest_phys_base: VM2_RAM_BASE_HPA,
                     guest_phys_size: PARTITION_RAM_SIZE,
                     pcpu_affinity: 1,
-                    assigned_pci_bdf: (0, 4, 0),
+                    assigned_pci_bdf: (
+                        VM2_PCI_BUS,
+                        VM2_PCI_DEVICE,
+                        VM2_PCI_FUNCTION,
+                    ),
                 },
             ],
         }

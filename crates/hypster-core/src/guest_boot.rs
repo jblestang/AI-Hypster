@@ -9,17 +9,34 @@ const PTE_WRITE: u64 = 1 << 1;
 const PTE_PS: u64 = 1 << 7;
 
 /// Install a 2 MiB identity map at the start of guest physical memory using 2 MiB pages,
-/// plus a minimal GDT (null/CS64/DS/TSS) at GPA 0x7000 for guest GDTR.
+/// plus a 2 MiB identity map covering shared IPC GPA `0xFE000000`, and a minimal GDT
+/// (null/CS64/DS/TSS) at GPA 0x7000 for guest GDTR.
 pub fn install_identity_map(guest_mem: &mut [u8]) {
-    assert!(guest_mem.len() >= 0xB000, "guest memory too small for page tables");
+    assert!(guest_mem.len() >= 0xC000, "guest memory too small for page tables");
 
     let pml4 = GUEST_CR3_GPA as usize;
     let pdpt = 0x9000usize;
-    let pd = 0xA000usize;
+    let pd_low = 0xA000usize;
+    let pd_ipc = 0xB000usize;
 
     write_u64(guest_mem, pml4, (pdpt as u64) | PTE_PRESENT | PTE_WRITE);
-    write_u64(guest_mem, pdpt, (pd as u64) | PTE_PRESENT | PTE_WRITE);
-    write_u64(guest_mem, pd, PTE_PRESENT | PTE_WRITE | PTE_PS);
+    write_u64(guest_mem, pdpt, (pd_low as u64) | PTE_PRESENT | PTE_WRITE);
+    write_u64(guest_mem, pd_low, PTE_PRESENT | PTE_WRITE | PTE_PS);
+
+    // Shared IPC at GPA 0xFE000000 → PDPT index 3, PD index 496 (2 MiB leaf).
+    let ipc_gpa = crate::ipc_region::SHARED_IPC_GPA;
+    let pdpt_idx = ((ipc_gpa >> 30) & 0x1FF) as usize;
+    let pd_idx = ((ipc_gpa >> 21) & 0x1FF) as usize;
+    write_u64(
+        guest_mem,
+        pdpt + pdpt_idx * 8,
+        (pd_ipc as u64) | PTE_PRESENT | PTE_WRITE,
+    );
+    write_u64(
+        guest_mem,
+        pd_ipc + pd_idx * 8,
+        (ipc_gpa & !0x1F_FFFF) | PTE_PRESENT | PTE_WRITE | PTE_PS,
+    );
 
     // GDT at 0x7000: idx0 null, idx1 CS64 (0x08), idx2 DS (0x10), idx3 TSS (0x18)
     for i in 0..5 {
@@ -37,4 +54,26 @@ pub fn install_identity_map(guest_mem: &mut [u8]) {
 
 fn write_u64(guest_mem: &mut [u8], offset: usize, value: u64) {
     guest_mem[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_map_covers_shared_ipc_gpa() {
+        let mut mem = [0u8; 0xC000];
+        install_identity_map(&mut mem);
+        let ipc = crate::ipc_region::SHARED_IPC_GPA;
+        let pdpt = 0x9000usize;
+        let pd_ipc = 0xB000usize;
+        let pdpt_idx = ((ipc >> 30) & 0x1FF) as usize;
+        let pd_idx = ((ipc >> 21) & 0x1FF) as usize;
+        let pdpt_e = u64::from_le_bytes(mem[pdpt + pdpt_idx * 8..][..8].try_into().unwrap());
+        let pd_e = u64::from_le_bytes(mem[pd_ipc + pd_idx * 8..][..8].try_into().unwrap());
+        assert_ne!(pdpt_e & PTE_PRESENT, 0);
+        assert_ne!(pd_e & PTE_PRESENT, 0);
+        assert_ne!(pd_e & PTE_PS, 0);
+        assert_eq!(pd_e & !0x1F_FFFF & !0xFFF, ipc & !0x1F_FFFF);
+    }
 }

@@ -274,9 +274,19 @@ pub const VTD_GCMD_SRTP: u32 = 1 << 30; // Set Root Table Pointer
             }
         }
 
-        // Dynamically assign discovered devices (B0:D3:F0 -> Domain 0, B0:D4:F0 -> Domain 1)
-        self.assign_device_bdf(0, 3, 0, 0);
-        self.assign_device_bdf(0, 4, 0, 1);
+        // Assign PCI BDFs from hardware_config.yaml (via build.rs constants).
+        self.assign_device_bdf(
+            crate::config::VM1_PCI_BUS,
+            crate::config::VM1_PCI_DEVICE,
+            crate::config::VM1_PCI_FUNCTION,
+            0,
+        );
+        self.assign_device_bdf(
+            crate::config::VM2_PCI_BUS,
+            crate::config::VM2_PCI_DEVICE,
+            crate::config::VM2_PCI_FUNCTION,
+            1,
+        );
 
         serial_print("[HYPSTER-IOMMU] VT-d Hardware Root Table Programmed at HPA ");
         serial_print_hex(self.root_table_pa);

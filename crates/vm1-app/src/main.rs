@@ -9,11 +9,10 @@ const HYPERCALL_GUEST_SHUTDOWN: u64 = 0x201;
 
 const SHARED_IPC_GPA: u64 = 0xFE000000;
 
-const MAX_PACKET_LEN: usize = 1514;
+const MAX_PACKET_LEN: usize = 1518;
 const CHANNEL_QUEUE_CAPACITY: usize = 16;
 const CHANNEL_QUEUE_MASK: usize = CHANNEL_QUEUE_CAPACITY - 1;
 
-/// Matches `hypster_core::channel::Packet` layout.
 #[repr(C, align(64))]
 struct Packet {
     data: [u8; MAX_PACKET_LEN],
@@ -25,11 +24,12 @@ struct CachePadded<T> {
     value: T,
 }
 
-/// Matches `hypster_core::channel::UnidirectionalChannel` layout at GPA `SHARED_IPC_GPA`.
+/// Matches host `UnidirectionalChannel` — `name` is a 16-byte `&str` fat pointer.
 #[repr(C, align(64))]
 struct UnidirectionalChannel {
     id: usize,
-    _name: usize,
+    _name_ptr: usize,
+    _name_len: usize,
     queue: [Packet; CHANNEL_QUEUE_CAPACITY],
     tail: CachePadded<AtomicUsize>,
     cached_head: CachePadded<usize>,
@@ -78,7 +78,6 @@ fn guest_shutdown() -> ! {
     }
 }
 
-/// SPSC producer send — same algorithm as `hypster_core::channel::UnidirectionalChannel::send`.
 fn channel_send(ch: &mut UnidirectionalChannel, data: &[u8]) -> bool {
     let tail = ch.tail.value.load(Ordering::Relaxed);
     let cached_head = unsafe { PROD_CACHED_HEAD };
@@ -88,7 +87,6 @@ fn channel_send(ch: &mut UnidirectionalChannel, data: &[u8]) -> bool {
         unsafe {
             PROD_CACHED_HEAD = actual_head;
         }
-
         if tail.wrapping_sub(actual_head) >= CHANNEL_QUEUE_CAPACITY {
             return false;
         }
@@ -98,7 +96,6 @@ fn channel_send(ch: &mut UnidirectionalChannel, data: &[u8]) -> bool {
     let copy_len = data.len().min(MAX_PACKET_LEN);
     ch.queue[slot_idx].data[..copy_len].copy_from_slice(&data[..copy_len]);
     ch.queue[slot_idx].len = copy_len;
-
     fence(Ordering::Release);
     ch.tail.value.store(tail.wrapping_add(1), Ordering::Release);
     true
@@ -111,7 +108,9 @@ pub extern "C" fn _start() -> ! {
     let msg = b"ping from VM1";
     unsafe {
         let ch = &mut *(SHARED_IPC_GPA as *mut UnidirectionalChannel);
-        if !channel_send(ch, msg) {
+        if channel_send(ch, msg) {
+            guest_print("VM1 sent IPC ping\n");
+        } else {
             guest_print("VM1 IPC send failed (ring full)\n");
         }
     }

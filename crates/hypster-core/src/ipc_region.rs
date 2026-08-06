@@ -32,4 +32,10 @@ mod tests {
         let need = CHANNEL_SLOT_SIZE * 2;
         assert!(need <= crate::config::SHARED_IPC_RING_SIZE as usize);
     }
+
+    #[test]
+    fn channel_slot_size_matches_guest_constant() {
+        // Keep in sync with vm1-app / vm2-app CHANNEL_SLOT_SIZE / field offsets.
+        assert_eq!(CHANNEL_SLOT_SIZE, 0x6140);
+    }
 }

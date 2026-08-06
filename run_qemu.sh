@@ -2,8 +2,9 @@
 set -e
 
 TARGET_MODE="${TARGET_MODE:-B}"
+SMP="${SMP:-1}"
 
-echo "=== Building Hypster Target ${TARGET_MODE}: guest(s) + UEFI loader ==="
+echo "=== Building Hypster Target ${TARGET_MODE}: guest(s) + UEFI loader (smp=${SMP}) ==="
 rustup target add x86_64-unknown-none x86_64-unknown-uefi 2>/dev/null || true
 
 # Absolute linker script path — relative -Tlinker.ld breaks when cargo is
@@ -18,6 +19,17 @@ objcopy -O binary target/x86_64-unknown-none/release/vm2-app target/x86_64-unkno
 
 unset RUSTFLAGS
 export TARGET_MODE
+
+# Phase 2: compile-time gate for AP trampoline (build.rs emits cfg hypster_smp).
+if [ "$SMP" -ge 2 ]; then
+  export HYPSTER_SMP=1
+else
+  unset HYPSTER_SMP
+fi
+
+# include_bytes! embeds guest bins at UEFI compile time — force rebuild when bins change.
+# Also touch so option_env!("HYPSTER_SMP") is re-evaluated after SMP toggles.
+touch crates/hypster-uefi/src/main.rs
 cargo build --target x86_64-unknown-uefi --release -p hypster-uefi
 
 echo "=== Preparing UEFI boot image ==="
@@ -47,9 +59,12 @@ else
   KVM_ARGS=(-cpu max)
 fi
 
+# Optional VT-d exercise: add -device intel-iommu,intremap=on
+
 qemu-system-x86_64 \
   "${KVM_ARGS[@]}" \
   -m 512M \
+  -smp "$SMP" \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file="$OVMF_VARS" \
   -drive file=esp.img,format=raw \

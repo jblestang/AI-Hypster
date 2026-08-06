@@ -66,7 +66,8 @@ impl VirtualMachine {
         let mut ept = crate::ept::EptManager::new(id);
         ept.map_region(0x0, mem_base_hpa, ram_bytes);
 
-        // Map Direct Hardware MMIO BAR (Bao/Jailhouse model) dynamically into Driver Domain EPT (0 VM-Exits!)
+        // Phase 1 dual-partition bring-up runs hello+shutdown guests only; MMIO passthrough
+        // is enabled when the VM2 e1000 driver runs (pd[256], not pd[0]).
         if id == 1 {
         // Verify security policy condition bounds
             let pci_devices = crate::pci::PciBusScanner::scan_all_e1000();

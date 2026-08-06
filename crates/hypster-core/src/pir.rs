@@ -101,13 +101,11 @@ impl PostedInterruptManager {
     /// Enforces non-interference invariants, memory range validation, and register safety.
     pub fn configure_vmcs(&self, vm_id: usize) {
         if cfg!(test) {
-        // Verify security policy condition bounds
             return;
         }
 
         let desc_ptr = &self.descriptors[vm_id.min(1)] as *const PostedInterruptDescriptor as u64;
         unsafe {
-        // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
             crate::vmx::vmwrite(VMCS_POSTED_INTERRUPT_NOTIFICATION_VECTOR, self.notification_vector as u64);
             crate::vmx::vmwrite(VMCS_POSTED_INTERRUPT_DESCRIPTOR_ADDRESS, desc_ptr);
         }
@@ -118,7 +116,11 @@ impl PostedInterruptManager {
         serial_print_hex(desc_ptr);
         serial_print(" (0 VM-Exit Hardware Interrupt Delivery Active)\n");
     }
+
+    /// Post `vector` into the PIR bitmap for `vm_id` (cross-partition doorbell).
+    pub fn post_vector(&mut self, vm_id: usize, vector: u8) {
+        self.descriptors[vm_id.min(1)].post_vector(vector);
+    }
 }
 
-    /// TSF security attribute field 
 pub static mut GLOBAL_PIR_MANAGER: PostedInterruptManager = PostedInterruptManager::new();

@@ -20,6 +20,7 @@ extern crate alloc;
 pub mod dual_run;
 pub mod guest_boot;
 pub mod guest_run;
+pub mod ap_trampoline;
 pub mod ept;
 pub mod vmx;
 pub mod vmexit;
@@ -156,6 +157,13 @@ impl Hypervisor {
 
         iommu.create_domain(0, VM1_ID, vm1_hpa, vm1_size);
         iommu.create_domain(1, VM2_ID, vm2_hpa, vm2_size);
+
+        // Reinforce YAML BDF → domain mapping (also done in program_hardware_vtd).
+        let cfg = config::StaticHypervisorConfig::default_system();
+        let (b0, d0, f0) = cfg.partitions[0].assigned_pci_bdf;
+        let (b1, d1, f1) = cfg.partitions[1].assigned_pci_bdf;
+        iommu.assign_device_bdf(b0, d0, f0, 0);
+        iommu.assign_device_bdf(b1, d1, f1, 1);
 
         serial_print("[HYPSTER] Static Partition 1: VM1-Alpha (smoltcp TCP/IP Stack)\n");
         serial_print("[HYPSTER] Static Partition 2: VM2-Beta  (Egress e1000 Driver)\n");
@@ -558,9 +566,11 @@ mod tests {
     /// Enforces non-interference invariants, memory range validation, and register safety.
     fn test_ept_passthrough_mmio_mapping() {
         let mut ept = ept::EptManager::new(1);
+        ept.map_region(0x0, 0x1DE8A000, 0x400000);
         ept.map_mmio_passthrough(0x2000_0000, 0xC108_0000, 0x200000);
         let translated = ept.translate_gpa(0x2000_0000);
         assert!(translated.is_some());
+        assert_eq!(ept.translate_gpa(0x8000).unwrap(), 0x1DE8A000 + 0x8000);
     }
 
     #[test]

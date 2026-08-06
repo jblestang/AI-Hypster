@@ -17,16 +17,21 @@ use crate::vmx::{
 };
 
 static mut ACTIVE_VCPU: *mut VCpu = core::ptr::null_mut();
-static GUEST_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Exposed for dual-partition shutdown checks after [`enter_guest`].
+pub static GUEST_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static mut ENTRY_FAILED: u64 = 0;
 static mut SAVED_GUEST_RAX: u64 = 0;
 static mut SAVED_GUEST_RCX: u64 = 0;
 static CPUID_PATCH_PENDING: AtomicBool = AtomicBool::new(false);
 static mut CPUID_GPR: [u64; 4] = [0; 4]; // rax, rbx, rcx, rdx
 
+/// 8 KiB exit stack: HOST_RSP at the top. After VM-exit `ret`, RSP lands at
+/// `base+8192` and subsequent host frames grow downward through this buffer
+/// (avoids clobbering BSS neighbors — see Task 10).
 #[repr(C, align(16))]
-struct HostExitStack([u8; 4096]);
+struct HostExitStack([u8; 8192]);
 
-static mut HOST_EXIT_STACK: HostExitStack = HostExitStack([0; 4096]);
+static mut HOST_EXIT_STACK: HostExitStack = HostExitStack([0; 8192]);
 
 core::arch::global_asm!(
     ".global vmx_exit_handler",
@@ -62,6 +67,7 @@ core::arch::global_asm!(
     "movzx eax, r11b",
     "test al, al",
     "jz 1f",
+    "call reload_host_rsp",
     "pop rax",
     "pop rcx",
     "pop rdx",
@@ -77,7 +83,6 @@ core::arch::global_asm!(
     "pop r13",
     "pop r14",
     "pop r15",
-    "call reload_host_rsp",
     "vmresume",
     "ud2",
     "1:",
@@ -103,9 +108,18 @@ extern "C" {
 
 /// VM-exit loads host RSP from VMCS_HOST_RSP. The exit stub pushes 15 GPRs then
 /// `ret`s to the continuation — RSP must equal the slot holding that address.
-fn host_exit_rsp_anchor() -> u64 {
-    core::ptr::addr_of_mut!(HOST_EXIT_STACK) as u64 + 4096 - 8
+pub fn host_exit_rsp_anchor(pcpu_id: usize) -> u64 {
+    let _ = pcpu_id;
+    // SAFETY: BSP exit stack; HOST_RSP at top so post-exit frames grow into the 8 KiB.
+    unsafe { core::ptr::addr_of_mut!(HOST_EXIT_STACK) as u64 + 8192 - 8 }
 }
+
+pub fn set_host_exit_pcpu(pcpu_id: usize) {
+    let _ = pcpu_id;
+}
+
+pub fn install_ap_exit_stack(_page_hpa: u64) {}
+
 
 #[no_mangle]
 extern "C" fn vmwrite_host_rsp(rsp: u64) {
@@ -132,7 +146,7 @@ extern "C" fn apply_cpuid_patch(gpr_stack: *mut u64) {
 #[no_mangle]
 extern "C" fn reload_host_rsp() {
     unsafe {
-        vmwrite(crate::vmx::VMCS_HOST_RSP, host_exit_rsp_anchor());
+        vmwrite(crate::vmx::VMCS_HOST_RSP, host_exit_rsp_anchor(0));
     }
 }
 
@@ -162,6 +176,7 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
                 HYPERCALL_GUEST_PUTCHAR => serial_putchar(guest_rcx as u8),
                 HYPERCALL_GUEST_SHUTDOWN => {
                     GUEST_STOP_REQUESTED.store(true, Ordering::SeqCst);
+                    ENTRY_FAILED = 0;
                     vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
                     serial_print("[HYPSTER] Guest shutdown acknowledged\n");
                     return 0;
@@ -176,6 +191,7 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
             true
         } else if exit_reason == 12 {
             // HLT — yield to host scheduler (return 0); shutdown uses VMCALL path.
+            ENTRY_FAILED = 0;
             vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
             return 0;
         } else if exit_reason == 10 {
@@ -213,6 +229,9 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
             false
         };
 
+        if !resume {
+            ENTRY_FAILED = 0;
+        }
         if resume { 1 } else { 0 }
     }
 }
@@ -236,9 +255,9 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
     ACTIVE_VCPU = vcpu as *mut VCpu;
     vmwrite(VMCS_HOST_RIP, vmx_exit_handler as *const () as u64);
 
-    let anchor = host_exit_rsp_anchor();
+    let anchor = host_exit_rsp_anchor(0);
     let continuation: u64;
-    let mut entry_failed: u64;
+    ENTRY_FAILED = 0xFFFF_FFFF_FFFF_FFFF;
 
     if use_launch {
         asm!(
@@ -247,14 +266,14 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
             "mov rdi, {anchor}",
             "call vmwrite_host_rsp",
             "call vmx_do_launch",
-            "mov {failed}, 1",
+            "mov QWORD PTR [{fail_slot}], 1",
             "jmp 3f",
             "2:",
-            "xor {failed}, {failed}",
+            "mov QWORD PTR [{fail_slot}], 0",
             "3:",
             anchor = in(reg) anchor,
             cont = out(reg) continuation,
-            failed = out(reg) entry_failed,
+            fail_slot = sym ENTRY_FAILED,
             out("rdi") _,
         );
     } else {
@@ -264,19 +283,19 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
             "mov rdi, {anchor}",
             "call vmwrite_host_rsp",
             "call vmx_do_resume",
-            "mov {failed}, 1",
+            "mov QWORD PTR [{fail_slot}], 1",
             "jmp 3f",
             "2:",
-            "xor {failed}, {failed}",
+            "mov QWORD PTR [{fail_slot}], 0",
             "3:",
             anchor = in(reg) anchor,
             cont = out(reg) continuation,
-            failed = out(reg) entry_failed,
+            fail_slot = sym ENTRY_FAILED,
             out("rdi") _,
         );
     }
 
-    if entry_failed != 0 {
+    if ENTRY_FAILED != 0 {
         return Err(vmread(VMCS_VM_INSTRUCTION_ERROR));
     }
     Ok(())
@@ -314,13 +333,14 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
     vcpu.registers.rsp = GUEST_STACK_TOP_GPA;
     vcpu.launched = false;
 
+    vmptrld_vmcs(vcpu);
     setup_hardware_vmcs(vcpu, ept_pml4_pa, GUEST_CR3_GPA);
     ACTIVE_VCPU = vcpu as *mut VCpu;
     vmwrite(VMCS_HOST_RIP, vmx_exit_handler as *const () as u64);
 
-    let anchor = host_exit_rsp_anchor();
+    let anchor = host_exit_rsp_anchor(0);
     let continuation: u64;
-    let mut launch_failed: u64;
+    ENTRY_FAILED = 0xFFFF_FFFF_FFFF_FFFF;
 
     asm!(
         "lea {cont}, [rip + 2f]",
@@ -328,23 +348,23 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
         "mov rdi, {anchor}",
         "call vmwrite_host_rsp",
         "call vmx_do_launch",
-        "mov {failed}, 1",
+        "mov QWORD PTR [{fail_slot}], 1",
         "jmp 3f",
         "2:",
-        "xor {failed}, {failed}",
+        "mov QWORD PTR [{fail_slot}], 0",
         "3:",
         anchor = in(reg) anchor,
         cont = out(reg) continuation,
-        failed = out(reg) launch_failed,
+        fail_slot = sym ENTRY_FAILED,
         out("rdi") _,
     );
 
-    if launch_failed != 0 {
-        return Err(vmread(VMCS_VM_INSTRUCTION_ERROR));
+    let launch_failed = ENTRY_FAILED;
+    if GUEST_STOP_REQUESTED.load(Ordering::SeqCst) || launch_failed == 0 {
+        serial_print("[HYPSTER] enter_guest returned from VM-exit loop\n");
+        return Ok(1);
     }
-
-    serial_print("[HYPSTER] enter_guest returned from VM-exit loop\n");
-    Ok(vcpu.launched as u64)
+    Err(vmread(VMCS_VM_INSTRUCTION_ERROR))
 }
 
 /// Prepare VMX and launch the guest partition once.
@@ -386,8 +406,13 @@ pub fn run_single_guest(
     unsafe {
         match enter_guest(vcpu, ept_pml4_pa) {
             Ok(_) => {
-                serial_print("[HYPSTER] Guest exited cleanly.\n");
-                Ok(())
+                if GUEST_STOP_REQUESTED.load(Ordering::SeqCst) {
+                    serial_print("[HYPSTER] Guest exited cleanly.\n");
+                    Ok(())
+                } else {
+                    serial_print("[HYPSTER] Guest stopped without shutdown hypercall\n");
+                    Err(0xDEAD)
+                }
             }
             Err(err) => {
                 serial_print("[HYPSTER-VTX] VMLAUNCH/VM-entry failed, error ");
@@ -396,5 +421,18 @@ pub fn run_single_guest(
                 Err(err)
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_exit_rsp_anchor_bsp() {
+        assert_ne!(host_exit_rsp_anchor(0), 0);
+        // Without AP stack installed, pCPU 1 falls back to BSP slot.
+        assert_eq!(host_exit_rsp_anchor(0), host_exit_rsp_anchor(1));
     }
 }
