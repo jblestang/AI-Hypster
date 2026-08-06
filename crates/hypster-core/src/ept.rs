@@ -265,8 +265,7 @@ impl EptManager {
     pub fn map_mmio_passthrough(&mut self, gpa: u64, hpa: u64, _size_bytes: u64) {
         #[cfg(test)]
         let _ept_guard = ept_test_lock();
-        #[cfg(test)]
-        self.clear_tables();
+        // Do not clear existing RAM/IPC tables — passthrough must layer onto them.
 
         let pml4_idx = ((gpa >> 39) & 0x1FF) as usize;
         let pdpt_idx = ((gpa >> 30) & 0x1FF) as usize;
