@@ -50,11 +50,11 @@ use serial::serial_print;
 /// Configured static VM configuration summary
 pub const VM1_ID: usize = 0;
 pub const VM1_VCPUS: usize = 1;
-pub const VM1_RAM_BYTES: u64 = 1 * 1024 * 1024 * 1024; // 1 GB
+pub const VM1_RAM_BYTES: u64 = crate::config::PARTITION_RAM_SIZE;
 
 pub const VM2_ID: usize = 1;
-pub const VM2_VCPUS: usize = 2;
-pub const VM2_RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+pub const VM2_VCPUS: usize = 1;
+pub const VM2_RAM_BYTES: u64 = crate::config::PARTITION_RAM_SIZE;
 
 /// TSF Subsystem Structure  implementing CC EAL5+ security controls.
 /// Common Criteria EAL5+ TSF Subsystem Interface Definition.
