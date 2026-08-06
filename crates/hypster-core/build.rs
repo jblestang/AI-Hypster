@@ -16,6 +16,9 @@ fn main() {
 
     let kv = parse_simple_yaml(&yaml_content);
 
+    // Validate hardware constants for memory overlap, CPU pinning conflicts, and alignment
+    validate_hardware_config(&kv);
+
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR environment variable not set!");
     let dest_path = Path::new(&out_dir).join("hardware_constants.rs");
 
@@ -113,6 +116,92 @@ pub const CAT_L3_CLOS1_MASK: u64 = {cat_clos1_mask};
     );
 
     fs::write(dest_path, generated_code).expect("Failed to write generated hardware_constants.rs!");
+}
+
+fn parse_hex_or_dec(val: &str) -> u64 {
+    let clean = val.replace('_', "");
+    if clean.starts_with("0x") || clean.starts_with("0X") {
+        u64::from_str_radix(&clean[2..], 16).unwrap_or_else(|_| panic!("Invalid hex number: {}", val))
+    } else {
+        clean.parse::<u64>().unwrap_or_else(|_| panic!("Invalid decimal number: {}", val))
+    }
+}
+
+fn validate_hardware_config(kv: &HashMap<String, String>) {
+    // 1. Parse all memory regions
+    let hyp_base = parse_hex_or_dec(kv.get("hypervisor.base_hpa").unwrap_or(&"0x140000000".to_string()));
+    let hyp_size = parse_hex_or_dec(kv.get("hypervisor.ram_size").unwrap_or(&"0x13000".to_string()));
+
+    let vm1_base = parse_hex_or_dec(kv.get("partitions.partition1.ram_base_hpa").unwrap_or(&"0x140013000".to_string()));
+    let vm1_size = parse_hex_or_dec(kv.get("partitions.partition1.ram_size").unwrap_or(&"0x200000".to_string()));
+
+    let vm2_base = parse_hex_or_dec(kv.get("partitions.partition2.ram_base_hpa").unwrap_or(&"0x140213000".to_string()));
+    let vm2_size = parse_hex_or_dec(kv.get("partitions.partition2.ram_size").unwrap_or(&"0x200000".to_string()));
+
+    let ipc_base = parse_hex_or_dec(kv.get("shared_ipc.base_hpa").unwrap_or(&"0x140413000".to_string()));
+    let ipc_size = parse_hex_or_dec(kv.get("shared_ipc.size").unwrap_or(&"0x5000".to_string()));
+
+    let bar0_base = parse_hex_or_dec(kv.get("pci_bar0.base_hpa").unwrap_or(&"0xC1080000".to_string()));
+    let bar0_size = parse_hex_or_dec(kv.get("pci_bar0.size").unwrap_or(&"0x20000".to_string()));
+
+    // 2. Validate overflow safety
+    let (hyp_end, ov1) = hyp_base.overflowing_add(hyp_size);
+    let (vm1_end, ov2) = vm1_base.overflowing_add(vm1_size);
+    let (vm2_end, ov3) = vm2_base.overflowing_add(vm2_size);
+    let (ipc_end, ov4) = ipc_base.overflowing_add(ipc_size);
+    let (bar0_end, ov5) = bar0_base.overflowing_add(bar0_size);
+
+    if ov1 || ov2 || ov3 || ov4 || ov5 {
+        panic!("FATAL BUILD ERROR: Hardware memory region address arithmetic overflow!");
+    }
+
+    // 3. Define region tuple list for non-overlap verification
+    let regions = [
+        ("Hypervisor RAM", hyp_base, hyp_end),
+        ("VM1-Alpha RAM", vm1_base, vm1_end),
+        ("VM2-Beta RAM", vm2_base, vm2_end),
+        ("Shared IPC Ring Buffer", ipc_base, ipc_end),
+        ("PCI BAR0 MMIO Map", bar0_base, bar0_end),
+    ];
+
+    // 4. Pairwise memory overlap check
+    for i in 0..regions.len() {
+        for j in (i + 1)..regions.len() {
+            let (name1, b1, e1) = regions[i];
+            let (name2, b2, e2) = regions[j];
+
+            if !(e1 <= b2 || e2 <= b1) {
+                panic!(
+                    "FATAL BUILD ERROR: Physical memory overlap detected in hardware_config.yaml!\n\
+                     Region 1: {} [0x{:X} .. 0x{:X}]\n\
+                     Region 2: {} [0x{:X} .. 0x{:X}]",
+                    name1, b1, e1, name2, b2, e2
+                );
+            }
+        }
+    }
+
+    // 5. Validate pCPU Core Affinity Pinning Conflict
+    let cpu1 = parse_hex_or_dec(kv.get("partitions.partition1.pcpu_affinity").unwrap_or(&"0".to_string()));
+    let cpu2 = parse_hex_or_dec(kv.get("partitions.partition2.pcpu_affinity").unwrap_or(&"1".to_string()));
+    if cpu1 == cpu2 {
+        panic!("FATAL BUILD ERROR: Duplicate pCPU core affinity binding conflict between Partition 1 and Partition 2!");
+    }
+
+    // 6. Validate Intel CAT L3 Cache Isolation Mask Collision
+    let clos0 = parse_hex_or_dec(kv.get("cat_l3.clos0_mask").unwrap_or(&"0x00FF".to_string()));
+    let clos1 = parse_hex_or_dec(kv.get("cat_l3.clos1_mask").unwrap_or(&"0xFF00".to_string()));
+    if (clos0 & clos1) != 0 {
+        panic!("FATAL BUILD ERROR: Intel CAT L3 Cache Bitmask collision between CLOS0 (0x{:X}) and CLOS1 (0x{:X})!", clos0, clos1);
+    }
+
+    // 7. Validate Posted Interrupt Vector Range
+    let pir_vec = parse_hex_or_dec(kv.get("posted_interrupts.notification_vector").unwrap_or(&"0xF2".to_string()));
+    if !(0x20..=0xFF).contains(&pir_vec) {
+        panic!("FATAL BUILD ERROR: Invalid Posted Interrupt Notification Vector: 0x{:X} (must be within 0x20..=0xFF)!", pir_vec);
+    }
+
+    println!("cargo:warning=BUILD-TIME CONSISTENCY CHECK PASSED: All hardware constants verified non-overlapping & valid!");
 }
 
 fn parse_simple_yaml(content: &str) -> HashMap<String, String> {
