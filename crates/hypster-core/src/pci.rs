@@ -115,6 +115,13 @@ impl PciBusScanner {
         }
     }
 
+    /// Read PCIe Extended 4KB Configuration Space via ECAM MMIO mapping (§19)
+    pub fn read_pcie_ecam_u32(ecam_base: u64, bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
+        let ecam_offset = ((bus as u64) << 20) | ((dev as u64) << 15) | ((func as u64) << 12) | ((offset as u64) & 0xFFF);
+        let ptr = (ecam_base + ecam_offset) as *const u32;
+        unsafe { core::ptr::read_volatile(ptr) }
+    }
+
     /// Read 64-bit BAR0 address supporting 64-bit PCI MMIO memory spaces
     pub fn read_bar0_64(bus: u8, dev: u8, func: u8) -> u64 {
         let bar0_low = Self::read_pci_config_u32(bus, dev, func, 0x10);
