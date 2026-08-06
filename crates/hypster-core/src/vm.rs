@@ -65,11 +65,6 @@ impl VirtualMachine {
 
         let mut ept = crate::ept::EptManager::new(id);
         ept.map_region(0x0, mem_base_hpa, ram_bytes);
-        ept.map_shared_region(
-            crate::ipc_region::SHARED_IPC_GPA,
-            crate::config::SHARED_IPC_RING_BASE_HPA,
-            crate::config::SHARED_IPC_RING_SIZE,
-        );
 
         // Map Direct Hardware MMIO BAR (Bao/Jailhouse model) dynamically into Driver Domain EPT (0 VM-Exits!)
         if id == 1 {
@@ -95,6 +90,15 @@ impl VirtualMachine {
             ept,
             finished: false,
         }
+    }
+
+    /// Map shared IPC ring at guest GPA `SHARED_IPC_GPA` to host buffer at `ipc_hpa`.
+    pub fn map_shared_ipc(&mut self, ipc_hpa: u64, size_bytes: u64) {
+        self.ept.map_shared_region(
+            crate::ipc_region::SHARED_IPC_GPA,
+            ipc_hpa,
+            size_bytes,
+        );
     }
 
     /// Executable TSF function  enforcing EAL5+ security policy rules.

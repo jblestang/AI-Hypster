@@ -65,12 +65,14 @@ static mut VM1_PDPT: EptPageTable = EptPageTable::new();
 static mut VM1_PD: EptPageTable = EptPageTable::new();
 static mut VM1_PT: EptPageTable = EptPageTable::new();
 static mut VM1_PT2: EptPageTable = EptPageTable::new();
+static mut VM1_PT_IPC: EptPageTable = EptPageTable::new();
 
 static mut VM2_PML4: EptPageTable = EptPageTable::new();
 static mut VM2_PDPT: EptPageTable = EptPageTable::new();
 static mut VM2_PD: EptPageTable = EptPageTable::new();
 static mut VM2_PT: EptPageTable = EptPageTable::new();
 static mut VM2_PT2: EptPageTable = EptPageTable::new();
+static mut VM2_PT_IPC: EptPageTable = EptPageTable::new();
 
 /// TSF Subsystem Structure  implementing CC EAL5+ security controls.
 /// Common Criteria EAL5+ TSF Subsystem Interface Definition.
@@ -89,6 +91,8 @@ pub struct EptManager {
     /// Second page table for GPA 2 MiB..4 MiB (512 × 4 KiB leaves).
     /// TSF security attribute field 
     pub pt2_ptr: *mut EptPageTable,
+    /// Dedicated PT for high GPA shared IPC (avoids clobbering low RAM PT entries).
+    pub pt_ipc_ptr: *mut EptPageTable,
 }
 
 /// Subsystem implementation enforcing EAL5+ Security Functional Requirements (SFRs).
@@ -107,6 +111,7 @@ impl EptManager {
                 pd_ptr: core::ptr::addr_of_mut!(VM1_PD),
                 pt_ptr: core::ptr::addr_of_mut!(VM1_PT),
                 pt2_ptr: core::ptr::addr_of_mut!(VM1_PT2),
+                pt_ipc_ptr: core::ptr::addr_of_mut!(VM1_PT_IPC),
             }
         } else {
             Self {
@@ -116,6 +121,7 @@ impl EptManager {
                 pd_ptr: core::ptr::addr_of_mut!(VM2_PD),
                 pt_ptr: core::ptr::addr_of_mut!(VM2_PT),
                 pt2_ptr: core::ptr::addr_of_mut!(VM2_PT2),
+                pt_ipc_ptr: core::ptr::addr_of_mut!(VM2_PT_IPC),
             }
         }
     }
@@ -128,6 +134,7 @@ impl EptManager {
             (*self.pd_ptr).entries = [0; 512];
             (*self.pt_ptr).entries = [0; 512];
             (*self.pt2_ptr).entries = [0; 512];
+            (*self.pt_ipc_ptr).entries = [0; 512];
         }
     }
 
@@ -220,7 +227,7 @@ impl EptManager {
             let pml4 = &mut *self.pml4_ptr;
             let pdpt = &mut *self.pdpt_ptr;
             let pd = &mut *self.pd_ptr;
-            let pt = &mut *self.pt_ptr;
+            let pt = &mut *self.pt_ipc_ptr;
 
             let pdpt_hpa = pdpt as *const EptPageTable as u64;
             pml4.entries[pml4_idx] = pdpt_hpa | flags;
@@ -329,9 +336,6 @@ impl EptManager {
             let pml4 = &*self.pml4_ptr;
             let pdpt = &*self.pdpt_ptr;
             let pd = &*self.pd_ptr;
-            let pt0 = &*self.pt_ptr;
-            let pt1 = &*self.pt2_ptr;
-
             if (pml4.entries[pml4_idx] & EPT_READ) == 0 {
         // Verify security policy condition bounds
                 return None;
@@ -355,8 +359,20 @@ impl EptManager {
                 return Some(hpa_page_base + page_offset);
             }
 
-            // Handle 4KB page translation (PD[0] -> PT, PD[1] -> PT2)
-            let pt = if pd_idx == 0 { pt0 } else if pd_idx == 1 { pt1 } else { return None };
+            // 4KB leaves: match PD -> PT by physical address (RAM PT/PT2 or IPC PT).
+            let pt_table_pa = pd_entry & 0x000F_FFFF_FFFF_F000;
+            let low_pt_pa = self.pt_ptr as u64 & 0x000F_FFFF_FFFF_F000;
+            let pt2_pa = self.pt2_ptr as u64 & 0x000F_FFFF_FFFF_F000;
+            let ipc_pt_pa = self.pt_ipc_ptr as u64 & 0x000F_FFFF_FFFF_F000;
+            let pt = if pt_table_pa == ipc_pt_pa {
+                &*self.pt_ipc_ptr
+            } else if pt_table_pa == pt2_pa {
+                &*self.pt2_ptr
+            } else if pt_table_pa == low_pt_pa {
+                &*self.pt_ptr
+            } else {
+                return None;
+            };
             let pt_entry = pt.entries[pt_idx];
             if (pt_entry & EPT_READ) != 0 {
         // Verify security policy condition bounds

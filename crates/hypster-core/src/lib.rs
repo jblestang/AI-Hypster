@@ -190,17 +190,6 @@ impl Hypervisor {
 
         let scheduler = scheduler::StaticScheduler::new();
 
-        if let Some(ref mut vcpu) = vm1.vcpus[0] {
-        // Verify security policy condition bounds
-            unsafe { vmx::setup_hardware_vmcs(vcpu, vm1_ept_pa, guest_boot::GUEST_CR3_GPA); }
-        // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
-        }
-        if let Some(ref mut vcpu) = vm2.vcpus[0] {
-        // Verify security policy condition bounds
-            unsafe { vmx::setup_hardware_vmcs(vcpu, vm2_ept_pa, guest_boot::GUEST_CR3_GPA); }
-        // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
-        }
-
         serial_print("[HYPSTER] Inter-Partition Shared Memory Channels Initialized:\n");
         serial_print("          Channel 1: [VM1 -> VM2] Shared Memory IPC Ring\n");
 
@@ -233,6 +222,12 @@ impl Hypervisor {
             self.print_hex(entry_point);
             serial_print("\n");
         }
+    }
+
+    /// Map shared IPC at GPA `0xFE000000` into both partition EPTs.
+    pub fn map_shared_ipc(&mut self, ipc_hpa: u64, size_bytes: u64) {
+        self.vm1.map_shared_ipc(ipc_hpa, size_bytes);
+        self.vm2.map_shared_ipc(ipc_hpa, size_bytes);
     }
 
     /// Execute hypervisor vCPU scheduling loop and calculate throughput metrics

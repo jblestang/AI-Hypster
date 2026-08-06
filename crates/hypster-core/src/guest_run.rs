@@ -287,6 +287,9 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
 pub unsafe fn run_vcpu_once(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<bool, u64> {
     GUEST_STOP_REQUESTED.store(false, Ordering::SeqCst);
 
+    vcpu.registers.rip = GUEST_ENTRY_GPA;
+    vcpu.registers.rsp = GUEST_STACK_TOP_GPA;
+
     vmptrld_vmcs(vcpu);
 
     if !vcpu.launched {
@@ -311,10 +314,34 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
     vcpu.registers.rsp = GUEST_STACK_TOP_GPA;
     vcpu.launched = false;
 
-    vmptrld_vmcs(vcpu);
     setup_hardware_vmcs(vcpu, ept_pml4_pa, GUEST_CR3_GPA);
+    ACTIVE_VCPU = vcpu as *mut VCpu;
+    vmwrite(VMCS_HOST_RIP, vmx_exit_handler as *const () as u64);
 
-    enter_guest_inner(vcpu, true)?;
+    let anchor = host_exit_rsp_anchor();
+    let continuation: u64;
+    let mut launch_failed: u64;
+
+    asm!(
+        "lea {cont}, [rip + 2f]",
+        "mov QWORD PTR [{anchor}], {cont}",
+        "mov rdi, {anchor}",
+        "call vmwrite_host_rsp",
+        "call vmx_do_launch",
+        "mov {failed}, 1",
+        "jmp 3f",
+        "2:",
+        "xor {failed}, {failed}",
+        "3:",
+        anchor = in(reg) anchor,
+        cont = out(reg) continuation,
+        failed = out(reg) launch_failed,
+        out("rdi") _,
+    );
+
+    if launch_failed != 0 {
+        return Err(vmread(VMCS_VM_INSTRUCTION_ERROR));
+    }
 
     serial_print("[HYPSTER] enter_guest returned from VM-exit loop\n");
     Ok(vcpu.launched as u64)
@@ -333,8 +360,18 @@ pub fn run_single_guest(
 
     let mem_base = guest_mem.as_mut_ptr() as u64;
     let guest_size = guest_mem.len() as u64;
+    let ipc_size = crate::config::SHARED_IPC_RING_SIZE as usize;
 
     let mut vm = crate::vm::VirtualMachine::new(0, "VM1-Guest", 1, guest_size, mem_base);
+
+    if guest_mem.len() >= ipc_size {
+        let ipc_hpa = mem_base + guest_mem.len() as u64 - crate::config::SHARED_IPC_RING_SIZE;
+        vm.map_shared_ipc(ipc_hpa, crate::config::SHARED_IPC_RING_SIZE);
+        unsafe {
+            crate::ipc_region::init_ipc_at_hpa(ipc_hpa);
+        }
+    }
+
     vm.load_code(guest_code, GUEST_ENTRY_GPA);
 
     let ept_pml4_pa = vm.ept.pml4_ptr as u64;

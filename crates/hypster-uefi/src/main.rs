@@ -31,8 +31,12 @@ fn panic_handler(_info: &core::panic::PanicInfo) -> ! {
 #[repr(C, align(4096))]
 struct AlignedPartitionBuffer([u8; 4 * 1024 * 1024]);
 
+#[repr(C, align(4096))]
+struct AlignedIpcBuffer([u8; 0xD000]);
+
 static mut VM1_PARTITION_BUF: AlignedPartitionBuffer = AlignedPartitionBuffer([0; 4 * 1024 * 1024]);
 static mut VM2_PARTITION_BUF: AlignedPartitionBuffer = AlignedPartitionBuffer([0; 4 * 1024 * 1024]);
+static mut SHARED_IPC_BUF: AlignedIpcBuffer = AlignedIpcBuffer([0; 0xD000]);
 
 #[entry]
 fn main() -> Status {
@@ -72,14 +76,19 @@ fn main() -> Status {
         } else {
             let vm2_ptr = core::ptr::addr_of_mut!(VM2_PARTITION_BUF).cast::<u8>();
             let vm2_slice = core::slice::from_raw_parts_mut(vm2_ptr, 4 * 1024 * 1024);
+            let ipc_ptr = core::ptr::addr_of_mut!(SHARED_IPC_BUF).cast::<u8>();
+            let ipc_slice = core::slice::from_raw_parts_mut(ipc_ptr, 0xD000);
 
             serial_print("[UEFI-LOADER] VM2 partition buffer HPA ");
             hypster_core::serial::serial_print_hex(vm2_ptr as u64);
             serial_print("\n");
+            serial_print("[UEFI-LOADER] Shared IPC buffer HPA ");
+            hypster_core::serial::serial_print_hex(ipc_ptr as u64);
+            serial_print("\n");
 
             static VM2_BINARY: &[u8] = include_bytes!("../../../target/x86_64-unknown-none/release/vm2-app.bin");
 
-            match run_dual_partitions(vm1_slice, vm2_slice, VM1_BINARY, VM2_BINARY) {
+            match run_dual_partitions(vm1_slice, vm2_slice, ipc_slice, VM1_BINARY, VM2_BINARY) {
                 Ok(()) => {
                     serial_print("\n========================================================\n");
                     serial_print("[HYPSTER] SUCCESS: Dual partitions ran under hardware VT-x\n");
