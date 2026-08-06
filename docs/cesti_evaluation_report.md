@@ -16,7 +16,7 @@
 As ANSSI-accredited CESTI Lead Security Auditors, we have performed an exhaustive source code implementation audit (`ADV_IMP.2`), architectural design review (`ADV_ARC.1`), formal security policy model audit (`ADV_SPM.1`), modular design review (`ADV_TDS.4`), toolchain compliance audit (`ALC_TAT.2`), test coverage verification (`ATE_COV.3`), and high-attack-potential vulnerability analysis (`AVA_VAN.5`) of the **Hypster Type-1 Static Partitioning Separation Kernel**.
 
 ### Final CESTI Verdict
-$$\mathbf{VERDICT: \quad PASS \quad - \quad CONFORMANT \ WITH \ ALL \ 18 \ EAL5+ \ SAR \ FAMILIES}$$
+$$\mathrm{VERDICT: \quad PASS \quad - \quad CONFORMANT \ WITH \ ALL \ 18 \ EAL5+ \ SAR \ FAMILIES}$$
 
 ---
 

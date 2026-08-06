@@ -340,31 +340,31 @@ Common Criteria **EAL5+ (ADV_SPM.1 / ADV_FSP.5 / ADV_TDS.4)** requires a **Forma
 
 ## 9.1 Theorem 1: Spatial Memory Non-Interference Proof
 
-Let $\mathcal{P} = \{P_1, P_2, \dots, P_n\}$ be the set of static partitions, and $M_{\text{TSF}}$ be the hypervisor memory space.
-Let $\text{Mem}(P_i) \subset \mathbb{N}$ denote the set of physical host memory addresses mapped in Partition $P_i$'s EPT page table.
+Let $\mathcal{P} = \{P_1, P_2, \dots, P_n\}$ be the set of static partitions, and $M_{\mathrm{TSF}}$ be the hypervisor memory space.
+Let $\mathrm{Mem}(P_i) \subset \mathbb{N}$ denote the set of physical host memory addresses mapped in Partition $P_i$'s EPT page table.
 
-$$\text{Theorem 1 (Non-Interference): } \forall P_i, P_j \in \mathcal{P}, i \neq j \implies \text{Mem}(P_i) \cap \text{Mem}(P_j) = \emptyset \quad \land \quad \text{Mem}(P_i) \cap M_{\text{TSF}} = \emptyset$$
+$$\mathrm{Theorem \ 1 \ (Non-Interference): } \forall P_i, P_j \in \mathcal{P}, i \neq j \implies \mathrm{Mem}(P_i) \cap \mathrm{Mem}(P_j) = \emptyset \quad \land \quad \mathrm{Mem}(P_i) \cap M_{\mathrm{TSF}} = \emptyset$$
 
 ### Proof Sketch (Constructive Induction via EPT Page Tables):
 1. **Base Step**: `StaticHypervisorConfig::validate()` verifies that for any two configured partitions $P_i, P_j$:
-   $$\Big([\text{base}_i, \text{base}_i + \text{size}_i) \cap [\text{base}_j, \text{base}_j + \text{size}_j)\Big] = \emptyset$$
-2. **Induction Step**: `EptManager::map_region(gpa, hpa, size)` constructs a 4-level paging hierarchy ($L_4 \to L_3 \to L_2 \to L_1$) where leaf entry physical frame numbers (PFNs) are strictly bounded by $hpa \in [\text{base}_i, \text{base}_i + \text{size}_i)$.
-3. **TSF Protection**: The EPT root pointer (`EPTP`) for partition $P_i$ contains zero leaf entries pointing to $M_{\text{TSF}} = [0x140000000, 0x140012FFF]$.
+   $$\Big([\mathrm{base}_i, \mathrm{base}_i + \mathrm{size}_i) \cap [\mathrm{base}_j, \mathrm{base}_j + \mathrm{size}_j)\Big] = \emptyset$$
+2. **Induction Step**: `EptManager::map_region(gpa, hpa, size)` constructs a 4-level paging hierarchy ($L_4 \to L_3 \to L_2 \to L_1$) where leaf entry physical frame numbers (PFNs) are strictly bounded by $hpa \in [\mathrm{base}_i, \mathrm{base}_i + \mathrm{size}_i)$.
+3. **TSF Protection**: The EPT root pointer (`EPTP`) for partition $P_i$ contains zero leaf entries pointing to $M_{\mathrm{TSF}} = [0x140000000, 0x140012FFF]$.
 4. **Q.E.D.**: No guest GPA can resolve to hypervisor memory or another partition's RAM. $\blacksquare$
 
 ---
 
 ## 9.2 Theorem 2: Intel VT-d IOMMU DMA Isolation Proof
 
-Let $\text{RequesterID}(D)$ be the 16-bit PCI Bus/Device/Function (BDF) identifier of physical device $D$.
-Let $\text{Domain}(P_i)$ be the VT-d context table entry mapping $\text{RequesterID}(D) \to \text{RootTableEntry}$.
+Let $\mathrm{RequesterID}(D)$ be the 16-bit PCI Bus/Device/Function (BDF) identifier of physical device $D$.
+Let $\mathrm{Domain}(P_i)$ be the VT-d context table entry mapping $\mathrm{RequesterID}(D) \to \mathrm{RootTableEntry}$.
 
-$$\text{Theorem 2 (DMA Isolation): } \text{DMA\_Target}(D) \subseteq \text{Mem}(P_i) \iff \text{RequesterID}(D) \in \text{Domain}(P_i)$$
+$$\mathrm{Theorem \ 2 \ (DMA \ Isolation): } \mathrm{DMA\_Target}(D) \subseteq \mathrm{Mem}(P_i) \iff \mathrm{RequesterID}(D) \in \mathrm{Domain}(P_i)$$
 
 ### Proof Sketch:
 1. `IommuManager::program_hardware_vtd()` initializes the hardware `RTADDR` register pointing to `VtdRootTable`.
-2. `assign_device_bdf(bus, dev, func, domain_id)` programs context table entries such that physical DMA translations ($L_3 \to L_2 \to L_1$) permit read/write access **only** to $HPA \in \text{Mem}(P_i)$.
-3. Physical DMA transactions issued by device $D$ targeting any address outside $\text{Mem}(P_i)$ trigger a hardware IOMMU fault flag (`F` bit 25 in `VTD_REG_GSTS`), terminating the transaction before reaching the DRAM bus controller.
+2. `assign_device_bdf(bus, dev, func, domain_id)` programs context table entries such that physical DMA translations ($L_3 \to L_2 \to L_1$) permit read/write access **only** to $HPA \in \mathrm{Mem}(P_i)$.
+3. Physical DMA transactions issued by device $D$ targeting any address outside $\mathrm{Mem}(P_i)$ trigger a hardware IOMMU fault flag (`F` bit 25 in `VTD_REG_GSTS`), terminating the transaction before reaching the DRAM bus controller.
 4. **Q.E.D.** $\blacksquare$
 
 ---
@@ -373,7 +373,7 @@ $$\text{Theorem 2 (DMA Isolation): } \text{DMA\_Target}(D) \subseteq \text{Mem}(
 
 Let $T \in \mathbb{N}$ be the tail index written by the Producer, and $H \in \mathbb{N}$ be the head index written by the Consumer.
 
-$$\text{Theorem 3 (Race-Free SPSC): } \forall t \ge 0, \quad (T(t) - H(t)) \le \text{CAPACITY}$$
+$$\mathrm{Theorem \ 3 \ (Race-Free \ SPSC): } \forall t \ge 0, \quad (T(t) - H(t)) \le \mathrm{CAPACITY}$$
 
 ### Proof Sketch:
 1. `UnidirectionalChannel::send()` loads $T$ via `Ordering::Relaxed` and $H$ via `Ordering::Acquire`.

@@ -27,31 +27,31 @@ Where:
 
 # 2. Invariant Predicates & Safety Theorems
 
-## 2.1 Invariant 1: Spatial Memory Non-Interference ($\text{Inv}_{\text{Memory}}$)
-For any valid state $s \in \mathcal{S}$, let $\text{Mem}(P_i, s)$ be the set of physical host memory addresses accessible to Partition $P_i$ via its 4-level EPT page table:
+## 2.1 Invariant 1: Spatial Memory Non-Interference ($\mathrm{Inv}_{\mathrm{Memory}}$)
+For any valid state $s \in \mathcal{S}$, let $\mathrm{Mem}(P_i, s)$ be the set of physical host memory addresses accessible to Partition $P_i$ via its 4-level EPT page table:
 
-$$\forall s \in \mathcal{S}, \quad \forall P_i, P_j \in \mathcal{P}, \quad i \neq j \implies \Big(\text{Mem}(P_i, s) \cap \text{Mem}(P_j, s) = \emptyset \quad \land \quad \text{Mem}(P_i, s) \cap M_{\text{TSF}} = \emptyset\Big)$$
+$$\forall s \in \mathcal{S}, \quad \forall P_i, P_j \in \mathcal{P}, \quad i \neq j \implies \Big(\mathrm{Mem}(P_i, s) \cap \mathrm{Mem}(P_j, s) = \emptyset \quad \land \quad \mathrm{Mem}(P_i, s) \cap M_{\mathrm{TSF}} = \emptyset\Big)$$
 
 ### Code Verification ([`crates/hypster-core/src/ept.rs:L75-130`](file:///root/hypster/crates/hypster-core/src/ept.rs#L75-L130))
-The EPT manager constructs non-overlapping 4-level paging trees. The hypervisor physical RAM space $M_{\text{TSF}} = [0x140000000, 0x140012FFF]$ is explicitly omitted from every guest partition's EPT root table (`EPTP`).
+The EPT manager constructs non-overlapping 4-level paging trees. The hypervisor physical RAM space $M_{\mathrm{TSF}} = [0x140000000, 0x140012FFF]$ is explicitly omitted from every guest partition's EPT root table (`EPTP`).
 
 ---
 
-## 2.2 Invariant 2: VT-d IOMMU DMA Isolation ($\text{Inv}_{\text{IOMMU}}$)
-Let $\text{Dev}(P_i)$ be the set of PCI Bus/Device/Function (BDF) identifiers assigned to Partition $P_i$.
-Let $\text{DMA\_Target}(d, s)$ be the physical memory address target of a DMA transaction issued by device $d \in \text{Dev}(P_i)$:
+## 2.2 Invariant 2: VT-d IOMMU DMA Isolation ($\mathrm{Inv}_{\mathrm{IOMMU}}$)
+Let $\mathrm{Dev}(P_i)$ be the set of PCI Bus/Device/Function (BDF) identifiers assigned to Partition $P_i$.
+Let $\mathrm{DMA\_Target}(d, s)$ be the physical memory address target of a DMA transaction issued by device $d \in \mathrm{Dev}(P_i)$:
 
-$$\forall s \in \mathcal{S}, \quad \forall d \in \text{Dev}(P_i) \implies \text{DMA\_Target}(d, s) \in \text{Mem}(P_i, s)$$
+$$\forall s \in \mathcal{S}, \quad \forall d \in \mathrm{Dev}(P_i) \implies \mathrm{DMA\_Target}(d, s) \in \mathrm{Mem}(P_i, s)$$
 
 ### Code Verification ([`crates/hypster-core/src/iommu.rs:L60-110`](file:///root/hypster/crates/hypster-core/src/iommu.rs#L60-L110))
 VT-d context tables map each assigned PCI BDF to a physical protection domain matching $P_i$'s RAM boundaries. Hardware IOMMU fault flags block unauthorized DMA before hitting the memory controller.
 
 ---
 
-## 2.3 Invariant 3: Lock-Free Atomic SPSC Queue Safety ($\text{Inv}_{\text{SPSC}}$)
+## 2.3 Invariant 3: Lock-Free Atomic SPSC Queue Safety ($\mathrm{Inv}_{\mathrm{SPSC}}$)
 Let $T(s) \in \mathbb{N}$ be the tail write index of an SPSC ring buffer in state $s$, and $H(s) \in \mathbb{N}$ be the head read index:
 
-$$\forall s \in \mathcal{S}, \quad 0 \le (T(s) - H(s)) \le \text{CHANNEL\_QUEUE\_CAPACITY}$$
+$$\forall s \in \mathcal{S}, \quad 0 \le (T(s) - H(s)) \le \mathrm{CHANNEL\_QUEUE\_CAPACITY}$$
 
 ### Code Verification ([`crates/hypster-core/src/channel.rs:L50-100`](file:///root/hypster/crates/hypster-core/src/channel.rs#L50-L100))
 `UnidirectionalChannel` uses atomic `Acquire`/`Release` fences and bitwise capacity masking (`idx & MASK`), eliminating data races and buffer overflows.
