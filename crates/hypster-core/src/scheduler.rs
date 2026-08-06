@@ -152,6 +152,12 @@ impl StaticScheduler {
     /// Common Criteria EAL5+ TSF Operational Verification:
     /// Enforces non-interference invariants, memory range validation, and register safety.
     pub fn new() -> Self {
+        Self::from_config()
+    }
+
+    /// Build schedule table from `hardware_config.yaml` partition pCPU affinities.
+    pub fn from_config() -> Self {
+        let config = crate::config::StaticHypervisorConfig::default_system();
         let mut sched = Self {
             current_index: 0,
             schedule_count: 0,
@@ -159,9 +165,16 @@ impl StaticScheduler {
             apic: LocalApicDriver::new(),
         };
 
-        sched.add_pin(0, 0, 0, 0); // VM 1 vCPU 0 -> Core 0
-        sched.add_pin(1, 0, 1, 1); // VM 2 vCPU 0 -> Core 1
-        sched.add_pin(1, 1, 2, 2); // VM 2 vCPU 1 -> Core 2
+        for i in 0..config.num_partitions {
+            let part = &config.partitions[i];
+            sched.add_pin(
+                part.vm_id,
+                0,
+                part.pcpu_affinity,
+                part.pcpu_affinity as u32,
+            );
+        }
+
         sched
     }
 
@@ -208,5 +221,19 @@ impl StaticScheduler {
     /// Enforces non-interference invariants, memory range validation, and register safety.
     pub fn current_pin(&self) -> VcpuCorePin {
         self.schedule_table[self.current_index]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StaticScheduler;
+
+    #[test]
+    fn scheduler_from_config_pins_two_vcpus() {
+        let s = StaticScheduler::from_config();
+        assert_eq!(s.schedule_table[0].vm_id, 0);
+        assert_eq!(s.schedule_table[0].pcpu_id, 0);
+        assert_eq!(s.schedule_table[1].vm_id, 1);
+        assert_eq!(s.schedule_table[1].pcpu_id, 1);
     }
 }
