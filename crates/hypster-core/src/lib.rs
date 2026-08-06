@@ -2,21 +2,30 @@
 
 extern crate alloc;
 
-pub mod serial;
+pub mod ept;
 pub mod vmx;
-pub mod vm;
-pub mod e1000_emu;
+pub mod vmexit;
+pub mod serial;
 pub mod channel;
 pub mod scheduler;
-pub mod ept;
-pub mod pci;
-pub mod vmexit;
 pub mod iommu;
+pub mod pci;
+pub mod e1000_emu;
+pub mod vm;
 pub mod config;
 pub mod health;
+pub mod pir;
+pub mod cat;
+pub mod ras;
 
+pub use vm::VirtualMachine;
+pub use channel::UnidirectionalChannel;
+pub use scheduler::StaticScheduler;
+pub use iommu::IommuManager;
 pub use config::StaticHypervisorConfig;
 pub use health::GLOBAL_HEALTH_MONITOR;
+pub use pir::GLOBAL_PIR_MANAGER;
+pub use cat::GLOBAL_CAT_MANAGER;
 
 use serial::serial_print;
 
@@ -303,5 +312,27 @@ mod tests {
         assert_eq!(record.fault_count, 1);
         assert_eq!(record.reset_count, 1);
         assert_eq!(record.state, health::PartitionState::Active);
+    }
+
+    #[test]
+    fn test_posted_interrupts() {
+        let mut desc = pir::PostedInterruptDescriptor::new();
+        desc.post_vector(0x40);
+        assert_eq!(desc.pir_bitmap[1], 1); // 0x40 = 64 (bit 0 of word 1)
+        assert_eq!(desc.control & 1, 1); // ON bit set
+    }
+
+    #[test]
+    fn test_intel_cat_cache_isolation() {
+        let cat = cat::IntelCatManager::new();
+        assert_eq!(cat.policies[0].l3_cache_mask, 0x00FF);
+        assert_eq!(cat.policies[1].l3_cache_mask, 0xFF00);
+    }
+
+    #[test]
+    fn test_machine_check_ras() {
+        ras::MachineCheckHandler::init_mca();
+        let fault = ras::MachineCheckHandler::handle_machine_check();
+        assert!(fault.is_none());
     }
 }
