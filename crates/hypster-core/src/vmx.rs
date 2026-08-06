@@ -189,8 +189,8 @@ pub const VMCS_GUEST_FS_BASE: u32 = 0x00006808;
 pub const VMCS_GUEST_GS_BASE: u32 = 0x0000680A;
 pub const VMCS_GUEST_LDTR_BASE: u32 = 0x0000680C;
 pub const VMCS_GUEST_TR_BASE: u32 = 0x0000680E;
-pub const VMCS_GUEST_GDTR_BASE: u32 = 0x00006810;
-pub const VMCS_GUEST_IDTR_BASE: u32 = 0x00006812;
+pub const VMCS_GUEST_GDTR_BASE: u32 = 0x00006816;
+pub const VMCS_GUEST_IDTR_BASE: u32 = 0x00006818;
 pub const VMCS_GUEST_RSP: u32 = 0x0000681C;
 pub const VMCS_GUEST_RIP: u32 = 0x0000681E;
 pub const VMCS_GUEST_RFLAGS: u32 = 0x00006820;
@@ -205,6 +205,8 @@ pub const VMCS_HOST_GDTR_BASE: u32 = 0x00006C0C;
 pub const VMCS_HOST_IDTR_BASE: u32 = 0x00006C0E;
 pub const VMCS_HOST_RSP: u32 = 0x00006C14;
 pub const VMCS_HOST_RIP: u32 = 0x00006C16;
+pub const VMCS_LINK_POINTER: u32 = 0x00002800;
+pub const VMCS_GUEST_IA32_EFER: u32 = 0x00002806;
 
 #[repr(C, align(4096))]
 /// TSF Subsystem Structure  implementing CC EAL5+ security controls.
@@ -466,8 +468,22 @@ pub unsafe fn invvpid(invvpid_type: u64, vpid: u16, gva: u64) -> bool {
     ok
 }
 
+/// Returns true when the CPU reports VMX support via CPUID.1:ECX.VMX[bit 5].
+pub fn vmx_supported() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    let info = unsafe { core::arch::x86_64::__cpuid(1) };
+    (info.ecx & (1 << 5)) != 0
+}
+
 /// Hardware VMXON Initialization
 pub unsafe fn enable_hardware_vmx() -> bool {
+    if !vmx_supported() {
+        serial_print("[HYPSTER-VTX] CPU does not report VMX — hardware guest unavailable.\n");
+        return false;
+    }
+
     serial_print("[HYPSTER-VTX] Initializing Hardware Intel VT-x (VMX Root Operation)...\n");
 
     // 1. Enable CR4.VMXE (Bit 13)
@@ -535,8 +551,7 @@ pub unsafe fn enable_hardware_vmx() -> bool {
 }
 
 /// Setup VMCS Fields for Hardware Guest Execution
-    /// TSF security attribute field 
-pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
+pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64, guest_cr3: u64) {
     let basic_msr = read_msr(IA32_VMX_BASIC_MSR);
     let rev_id = (basic_msr & 0x7FFFFFFF) as u32;
 
@@ -547,12 +562,14 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
     asm!("vmclear [{0}]", in(reg) &vmcs_pa, options(readonly));
     asm!("vmptrld [{0}]", in(reg) &vmcs_pa, options(readonly));
 
-    // 1. Write Pin-Based, CPU-Based, Exit & Entry Execution Controls
-    let pin_ctls = (read_msr(IA32_VMX_PINBASED_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 6); // Activate VMX Preemption Timer (bit 6)
-    let proc_ctls = (read_msr(IA32_VMX_PROCBASED_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 31) | (1 << 28); // Enable Secondary Controls (bit 31) & Use MSR Bitmaps (bit 28)
-    let sec_proc_ctls = (read_msr(IA32_VMX_PROCBASED_CTLS2_MSR) & 0xFFFFFFFF) as u32 | (1 << 1) | (1 << 7); // Enable EPT (bit 1) & Unrestricted Guest (bit 7)
-    let exit_ctls = (read_msr(IA32_VMX_EXIT_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 9); // 64-bit Host Mode
-    let entry_ctls = (read_msr(IA32_VMX_ENTRY_CTLS_MSR) & 0xFFFFFFFF) as u32;
+    vmwrite(VMCS_LINK_POINTER, 0xFFFF_FFFF_FFFF_FFFF);
+
+    // Pin-based: no preemption timer. Secondary: EPT + unrestricted guest. Entry: IA-32e guest.
+    let pin_ctls = (read_msr(IA32_VMX_PINBASED_CTLS_MSR) & 0xFFFFFFFF) as u32;
+    let proc_ctls = (read_msr(IA32_VMX_PROCBASED_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 31);
+    let sec_proc_ctls = (read_msr(IA32_VMX_PROCBASED_CTLS2_MSR) & 0xFFFFFFFF) as u32 | (1 << 1) | (1 << 7);
+    let exit_ctls = (read_msr(IA32_VMX_EXIT_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 9);
+    let entry_ctls = (read_msr(IA32_VMX_ENTRY_CTLS_MSR) & 0xFFFFFFFF) as u32 | (1 << 9);
 
     vmwrite(VMCS_PIN_BASED_VM_EXEC_CONTROL, pin_ctls as u64);
     vmwrite(VMCS_CPU_BASED_VM_EXEC_CONTROL, proc_ctls as u64);
@@ -564,14 +581,6 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
     let eptp = (ept_pml4_pa & !0xFFF) | (3 << 3) | 6;
     vmwrite(VMCS_EPT_POINTER, eptp);
 
-    let msr_bitmap_ptr = if vcpu.id == 0 {
-        core::ptr::addr_of_mut!(MSR_BITMAP_1)
-    } else {
-        core::ptr::addr_of_mut!(MSR_BITMAP_2)
-    };
-    vmwrite(VMCS_MSR_BITMAP, msr_bitmap_ptr as u64);
-    vmwrite(VMCS_VMX_PREEMPTION_TIMER_VALUE, 100_000);
-
     // 3. Write Guest State Fields
     vmwrite(VMCS_GUEST_RIP, vcpu.registers.rip);
     vmwrite(VMCS_GUEST_RSP, vcpu.registers.rsp);
@@ -580,7 +589,7 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
     vmwrite(VMCS_GUEST_CS_SELECTOR, 0x08);
     vmwrite(VMCS_GUEST_CS_BASE, 0x0);
     vmwrite(VMCS_GUEST_CS_LIMIT, 0xFFFFFFFF);
-    vmwrite(VMCS_GUEST_CS_AR_BYTES, 0xC09B); // Present, Code, Exec/Read, 64-bit
+    vmwrite(VMCS_GUEST_CS_AR_BYTES, 0xA09B); // Present, 64-bit code, exec/read
 
     vmwrite(VMCS_GUEST_DS_SELECTOR, 0x10);
     vmwrite(VMCS_GUEST_DS_BASE, 0x0);
@@ -606,7 +615,7 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
     vmwrite(VMCS_GUEST_FS_AR_BYTES, 0xC093);
     vmwrite(VMCS_GUEST_GS_AR_BYTES, 0xC093);
     vmwrite(VMCS_GUEST_LDTR_AR_BYTES, 0x10000); // Unusable
-    vmwrite(VMCS_GUEST_TR_AR_BYTES, 0x8B);      // Busy 32-bit TSS
+    vmwrite(VMCS_GUEST_TR_AR_BYTES, 0x10000);   // Unusable (no guest TSS required)
 
     // 3. Compute guest CR0 and CR4 using hardware IA32_VMX_CR0_FIXED0/FIXED1 MSRs
     let fixed0_cr0 = unsafe { read_msr(IA32_VMX_CR0_FIXED0_MSR) };
@@ -620,8 +629,13 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
     unsafe {
         // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
         vmwrite(VMCS_GUEST_CR0, guest_cr0);
-        vmwrite(VMCS_GUEST_CR3, 0x1000);
+        vmwrite(VMCS_GUEST_CR3, guest_cr3);
         vmwrite(VMCS_GUEST_CR4, guest_cr4);
+        vmwrite(VMCS_GUEST_IA32_EFER, 0x500); // LME | LMA
+        vmwrite(VMCS_GUEST_GDTR_BASE, 0x7000);
+        vmwrite(VMCS_GUEST_IDTR_BASE, 0x7000);
+        vmwrite(VMCS_GUEST_GDTR_LIMIT, 0xFFFF);
+        vmwrite(VMCS_GUEST_IDTR_LIMIT, 0xFFFF);
     }
 
     // 4. Write Host State Fields
@@ -641,7 +655,10 @@ pub unsafe fn setup_hardware_vmcs(vcpu: &mut VCpu, ept_pml4_pa: u64) {
     vmwrite(VMCS_HOST_SS_SELECTOR, 0x30);
     vmwrite(VMCS_HOST_FS_SELECTOR, 0x0);
     vmwrite(VMCS_HOST_GS_SELECTOR, 0x0);
-    vmwrite(VMCS_HOST_TR_SELECTOR, 0x0);   // Matches UEFI active Task Register
+    vmwrite(VMCS_HOST_TR_SELECTOR, 0x0);
+
+    vmwrite(VMCS_HOST_FS_BASE, 0);
+    vmwrite(VMCS_HOST_GS_BASE, 0);
 
     serial_print("[HYPSTER-VTX] Hardware VMCS Region Configured for VM ");
     crate::serial::serial_print_dec(vcpu.id as u64);

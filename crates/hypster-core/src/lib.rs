@@ -17,6 +17,8 @@
 
 extern crate alloc;
 
+pub mod guest_boot;
+pub mod guest_run;
 pub mod ept;
 pub mod vmx;
 pub mod vmexit;
@@ -33,6 +35,7 @@ pub mod pir;
 pub mod cat;
 pub mod ras;
 
+pub use guest_run::run_single_guest;
 pub use vm::VirtualMachine;
 pub use channel::UnidirectionalChannel;
 pub use scheduler::StaticScheduler;
@@ -177,12 +180,12 @@ impl Hypervisor {
 
         if let Some(ref mut vcpu) = vm1.vcpus[0] {
         // Verify security policy condition bounds
-            unsafe { vmx::setup_hardware_vmcs(vcpu, vm1_ept_pa); }
+            unsafe { vmx::setup_hardware_vmcs(vcpu, vm1_ept_pa, guest_boot::GUEST_CR3_GPA); }
         // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
         }
         if let Some(ref mut vcpu) = vm2.vcpus[0] {
         // Verify security policy condition bounds
-            unsafe { vmx::setup_hardware_vmcs(vcpu, vm2_ept_pa); }
+            unsafe { vmx::setup_hardware_vmcs(vcpu, vm2_ept_pa, guest_boot::GUEST_CR3_GPA); }
         // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
         }
 

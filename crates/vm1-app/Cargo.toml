@@ -3,6 +3,7 @@ name = "vm1-app"
 version = "0.1.0"
 edition = "2021"
 
-[dependencies]
-e1000-spec = { path = "../e1000-spec" }
-smoltcp = { version = "0.11", default-features = false, features = ["proto-ipv4", "socket-tcp", "medium-ethernet"] }
+[profile.release]
+opt-level = 2
+codegen-units = 1
+panic = "abort"

@@ -3,3 +3,4 @@ esp/
 esp.img
 *.bin
 *.log
+ovmf_vars.fd
