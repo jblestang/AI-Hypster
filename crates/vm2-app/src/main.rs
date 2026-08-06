@@ -2,136 +2,170 @@
 #![no_main]
 
 use core::panic::PanicInfo;
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer};
+use core::sync::atomic::{AtomicUsize, Ordering, fence};
+
+const HYPERCALL_GUEST_PUTCHAR: u64 = 0x200;
+const HYPERCALL_GUEST_SHUTDOWN: u64 = 0x201;
+
+const SHARED_IPC_GPA: u64 = 0xFE000000;
+
+const MAX_PACKET_LEN: usize = 1518;
+const CHANNEL_QUEUE_CAPACITY: usize = 16;
+const CHANNEL_QUEUE_MASK: usize = CHANNEL_QUEUE_CAPACITY - 1;
+
+/// Matches `hypster_core::channel::Packet` layout.
+#[repr(C, align(64))]
+struct Packet {
+    data: [u8; MAX_PACKET_LEN],
+    len: usize,
+}
+
+#[repr(C, align(64))]
+struct CachePadded<T> {
+    value: T,
+}
+
+/// Matches `hypster_core::channel::UnidirectionalChannel` layout.
+#[repr(C, align(64))]
+struct UnidirectionalChannel {
+    id: usize,
+    _name: usize,
+    queue: [Packet; CHANNEL_QUEUE_CAPACITY],
+    tail: CachePadded<AtomicUsize>,
+    cached_head: CachePadded<usize>,
+    head: CachePadded<AtomicUsize>,
+    cached_tail: CachePadded<usize>,
+}
+
+const CHANNEL_SLOT_SIZE: usize = core::mem::size_of::<UnidirectionalChannel>();
+
+static mut CONS_CACHED_TAIL: usize = 0;
+static mut PROD_CACHED_HEAD: usize = 0;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    loop {}
+    guest_print("PANIC in VM2 guest\n");
+    guest_shutdown();
 }
 
-pub struct E1000OutRxToken {
-    buffer: [u8; 1514],
-    length: usize,
+#[inline(always)]
+fn hypercall(num: u64, arg0: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "vmcall",
+            inout("rax") num => ret,
+            in("rcx") arg0,
+            options(nostack, preserves_flags),
+        );
+    }
+    ret
 }
 
-impl RxToken for E1000OutRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        f(&mut self.buffer[..self.length])
+fn guest_putchar(byte: u8) {
+    hypercall(HYPERCALL_GUEST_PUTCHAR, byte as u64);
+}
+
+fn guest_print(s: &str) {
+    for byte in s.bytes() {
+        guest_putchar(byte);
     }
 }
 
-pub struct E1000OutTxToken;
-
-impl TxToken for E1000OutTxToken {
-    fn consume<R, F>(self, len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        let mut buf = [0u8; 1514];
-        let res = f(&mut buf[..len.min(1514)]);
-
-        // Write to VM2 e1000 MMIO Transmit Descriptor Tail Register (0x20000318)
+fn guest_shutdown() -> ! {
+    hypercall(HYPERCALL_GUEST_SHUTDOWN, 0);
+    loop {
         unsafe {
-            let tdt_ptr = 0x20000318 as *mut u32;
-            core::ptr::write_volatile(tdt_ptr, 1);
+            core::arch::asm!("hlt", options(nomem, nostack));
         }
-        res
     }
 }
 
-pub struct E1000OutPhyDevice {
-    has_packet: bool,
-}
+/// SPSC consumer receive — same algorithm as `hypster_core::channel::UnidirectionalChannel::recv`.
+fn channel_recv(ch: &mut UnidirectionalChannel) -> Option<(usize, [u8; MAX_PACKET_LEN])> {
+    let head = ch.head.value.load(Ordering::Relaxed);
+    let cached_tail = unsafe { CONS_CACHED_TAIL };
 
-impl E1000OutPhyDevice {
-    pub fn new() -> Self {
-        Self { has_packet: true }
-    }
-}
+    if head == cached_tail {
+        let actual_tail = ch.tail.value.load(Ordering::Acquire);
+        unsafe {
+            CONS_CACHED_TAIL = actual_tail;
+        }
 
-impl Device for E1000OutPhyDevice {
-    type RxToken<'a> = E1000OutRxToken where Self: 'a;
-    type TxToken<'a> = E1000OutTxToken where Self: 'a;
-
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.has_packet {
-            self.has_packet = false;
-
-            // Direct Guest EPT Memory Shared Memory Receive (0 VM-Exits!)
-            let mut rx = E1000OutRxToken {
-                buffer: [0u8; 1514],
-                length: 64,
-            };
-            // Populate Ethernet frame header for VM2 smoltcp stack output processing
-            rx.buffer[0..6].copy_from_slice(&[0x52, 0x54, 0x00, 0x65, 0x43, 0x21]); // Dest MAC (VM2)
-            rx.buffer[6..12].copy_from_slice(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]); // Src MAC (VM1)
-            rx.buffer[12..14].copy_from_slice(&[0x08, 0x00]); // EtherType IPv4
-
-            Some((rx, E1000OutTxToken))
-        } else {
-            None
+        if head == actual_tail {
+            return None;
         }
     }
 
-    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(E1000OutTxToken)
+    fence(Ordering::Acquire);
+
+    let slot_idx = head & CHANNEL_QUEUE_MASK;
+    let len = ch.queue[slot_idx].len.min(MAX_PACKET_LEN);
+    let mut data = [0u8; MAX_PACKET_LEN];
+    data[..len].copy_from_slice(&ch.queue[slot_idx].data[..len]);
+
+    ch.head.value.store(head.wrapping_add(1), Ordering::Release);
+    Some((len, data))
+}
+
+/// SPSC producer send on the VM2 -> VM1 ack channel.
+fn channel_send(ch: &mut UnidirectionalChannel, data: &[u8]) -> bool {
+    let tail = ch.tail.value.load(Ordering::Relaxed);
+    let cached_head = unsafe { PROD_CACHED_HEAD };
+
+    if tail.wrapping_sub(cached_head) >= CHANNEL_QUEUE_CAPACITY {
+        let actual_head = ch.head.value.load(Ordering::Acquire);
+        unsafe {
+            PROD_CACHED_HEAD = actual_head;
+        }
+
+        if tail.wrapping_sub(actual_head) >= CHANNEL_QUEUE_CAPACITY {
+            return false;
+        }
     }
 
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = 1514;
-        caps
+    let slot_idx = tail & CHANNEL_QUEUE_MASK;
+    let copy_len = data.len().min(MAX_PACKET_LEN);
+    ch.queue[slot_idx].data[..copy_len].copy_from_slice(&data[..copy_len]);
+    ch.queue[slot_idx].len = copy_len;
+
+    fence(Ordering::Release);
+    ch.tail.value.store(tail.wrapping_add(1), Ordering::Release);
+    true
+}
+
+fn guest_print_bytes(data: &[u8]) {
+    for &byte in data {
+        guest_putchar(byte);
     }
 }
 
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
-    // 1. Register VM2 with hypervisor
-    unsafe {
-        core::arch::asm!(
-            "mov rax, 0x101",
-            "mov rcx, 0x02",
-            "vmcall",
-            inout("rax") 0x101u64 => _,
-            inout("rcx") 2u64 => _,
-        );
-    }
+    guest_print("VM2 waiting for IPC ping...\n");
 
-    // 2. Initialize smoltcp stack inside VM2 guest environment
-    let mut phy_device = E1000OutPhyDevice::new();
-    let mac = HardwareAddress::Ethernet(EthernetAddress([0x52, 0x54, 0x00, 0x65, 0x43, 0x21]));
-    let mut config = Config::new(mac);
-    config.random_seed = 0x87654321;
-
-    let mut iface = Interface::new(config, &mut phy_device, Instant::from_millis(0));
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(192, 168, 1, 20)), 24));
-    });
-
-    let mut rx_buf = [0u8; 1024];
-    let mut tx_buf = [0u8; 1024];
-    let tcp_socket = TcpSocket::new(TcpSocketBuffer::new(&mut rx_buf[..]), TcpSocketBuffer::new(&mut tx_buf[..]));
-    let mut socket_storage = [SocketStorage::EMPTY; 2];
-    let mut sockets = SocketSet::new(&mut socket_storage[..]);
-    let _handle = sockets.add(tcp_socket);
-
-    // 3. Poll VM2 smoltcp stack loop
-    let mut time_ms = 0i64;
     loop {
-        let timestamp = Instant::from_millis(time_ms);
-        iface.poll(timestamp, &mut phy_device, &mut sockets);
-        time_ms += 10;
+        let got_message = unsafe {
+            let ch = &mut *(SHARED_IPC_GPA as *mut UnidirectionalChannel);
+            if let Some((len, data)) = channel_recv(ch) {
+                guest_print("VM2 received: ");
+                guest_print_bytes(&data[..len]);
+                guest_print("\n");
+
+                let ack_ch = &mut *((SHARED_IPC_GPA + CHANNEL_SLOT_SIZE as u64) as *mut UnidirectionalChannel);
+                let _ = channel_send(ack_ch, b"ack from VM2");
+                true
+            } else {
+                false
+            }
+        };
+
+        if got_message {
+            guest_shutdown();
+        }
 
         unsafe {
-            core::arch::asm!("hlt");
+            core::arch::asm!("hlt", options(nomem, nostack));
         }
     }
 }
