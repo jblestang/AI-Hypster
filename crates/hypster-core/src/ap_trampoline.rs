@@ -68,8 +68,12 @@ static mut AP_HOST_STACKS: ApHostStacks = ApHostStacks([0; 16384]);
 
 const AP_RUST_STACK_TOP: u64 = 8192;
 const AP_EXIT_STACK_TOP: u64 = 16384;
-/// Prefer RSP-based identity when on the AP stacks; otherwise the explicit
-/// `HOST_EXIT_PCPU` latch (set before AP `enter_guest`).
+/// Identify pCPU from RSP only.
+///
+/// IMPORTANT: never fall back to a global `HOST_EXIT_PCPU` latch while the AP is
+/// merely parked. Prior concurrent attempts set that latch at MpServices entry,
+/// which made the BSP's `vmwrite_host_rsp` steal the AP exit stack and #PF
+/// (RIP/CR2 = -1, GDTR/IDTR.limit = 0xFFFF) on BSP `VMLAUNCH`.
 #[inline(always)]
 pub fn current_pcpu() -> usize {
     let rsp: u64;
@@ -80,7 +84,7 @@ pub fn current_pcpu() -> usize {
     if rsp >= base && rsp < base + core::mem::size_of::<ApHostStacks>() as u64 {
         1
     } else {
-        HOST_EXIT_PCPU.load(Ordering::Relaxed).min(1)
+        0
     }
 }
 
@@ -89,6 +93,8 @@ pub fn host_exit_pcpu() -> usize {
 }
 
 pub fn set_host_exit_pcpu(pcpu_id: usize) {
+    // Kept for call-site compatibility; identity is RSP-based. Do not rely on
+    // this latch for BSP/AP discrimination while both may run.
     HOST_EXIT_PCPU.store(pcpu_id.min(1), Ordering::SeqCst);
 }
 
@@ -180,12 +186,13 @@ pub fn prepare_ap_context() {
     serial_print("\n");
 }
 
-/// UEFI `MpServices` AP entry. Expects [`set_ap_vm2_ept`] already called; runs VM2
-/// after BSP has finished VM1 and set `AP_BSP_WAITING`.
+/// UEFI `MpServices` AP entry. Expects [`set_ap_vm2_ept`] already called.
+///
+/// Parks without touching VMX or the host-exit pCPU latch (see [`current_pcpu`]),
+/// then runs VM2 once `AP_RUN_VM2` + `AP_BSP_WAITING` are set.
 pub extern "efiapi" fn ap_uefi_procedure(_arg: *mut core::ffi::c_void) {
-    set_host_exit_pcpu(1);
+    // Signal ready first with minimal side effects — no set_host_exit_pcpu here.
     AP_READY.store(true, Ordering::SeqCst);
-    serial_print("[HYPSTER-SMP] ap_uefi_procedure on AP — running VM2\n");
 
     let timeout_spins = 50_000_000u64;
     let mut spins = 0u64;
@@ -202,7 +209,7 @@ pub extern "efiapi" fn ap_uefi_procedure(_arg: *mut core::ffi::c_void) {
         core::hint::spin_loop();
     }
 
-    // Wait until BSP has finished MpServices chatter and is in its join loop.
+    // Wait until BSP has finished MpServices chatter and is ready for overlap.
     spins = 0;
     while !AP_BSP_WAITING.load(Ordering::SeqCst) {
         spins += 1;
@@ -213,6 +220,8 @@ pub extern "efiapi" fn ap_uefi_procedure(_arg: *mut core::ffi::c_void) {
         }
         core::hint::spin_loop();
     }
+
+    serial_print("[HYPSTER-SMP] ap_uefi_procedure on AP — running VM2\n");
 
     // Run VM2 on the dedicated AP stack — MpServices stacks are too small for
     // VT-x setup + exit handling and have triggered host panics mid-guest I/O.
@@ -362,7 +371,7 @@ unsafe fn run_vm2_on_ap() {
     match hv.vcpu_mut(crate::VM2_ID, 0) {
         Ok(vcpu) => match crate::guest_run::enter_guest(vcpu, ept_pa) {
             Ok(_) => {
-                if crate::guest_run::GUEST_STOP_REQUESTED.load(Ordering::SeqCst) {
+                if crate::guest_run::guest_stop_requested(1) {
                     AP_VM2_OK.store(true, Ordering::SeqCst);
                     serial_print("[HYPSTER-SMP] AP: VM2 exited cleanly\n");
                 } else {

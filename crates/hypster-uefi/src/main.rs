@@ -8,6 +8,7 @@ use uefi::proto::pi::mp::MpServices;
 use uefi::boot::{self, EventType, Tpl};
 
 use hypster_core::serial::serial_print;
+use hypster_core::throughput;
 use hypster_core::{run_dual_partitions, run_single_guest};
 
 /// True when `TARGET_MODE=A` at UEFI build time; default is Target B (dual partition).
@@ -47,14 +48,14 @@ static mut SHARED_IPC_BUF: AlignedIpcBuffer = AlignedIpcBuffer([0; 0xD000]);
 /// Park an AP on [`hypster_core::ap_trampoline::ap_uefi_procedure`] via non-blocking
 /// `MpServices::startup_this_ap`. Nested KVM/OVMF cannot use INIT-SIPI safely.
 ///
-/// Called from dual-run **after VM1 + VMXOFF** — a live AP during BSP `VMLAUNCH`
-/// causes host `#PF` under nested KVM.
+/// Concurrent mode starts the AP *before* dual VMLAUNCH (AP waits on flags without
+/// touching the BSP host-exit stack). Sequential fallback still works post-VM1.
 extern "C" fn start_ap_via_mp_services() -> bool {
     if !HYPSTER_SMP {
         return false;
     }
 
-    serial_print("[UEFI-LOADER] Phase 2: starting AP via MpServices (post-VM1)\n");
+    serial_print("[UEFI-LOADER] Phase 2: starting AP via MpServices\n");
     hypster_core::ap_trampoline::prepare_ap_context();
     // BSP arms AP_RUN_VM2 before invoking this hook; re-assert after prepare.
     hypster_core::ap_trampoline::AP_RUN_VM2.store(true, core::sync::atomic::Ordering::SeqCst);
@@ -176,8 +177,7 @@ fn main() -> Status {
                 }
             }
         } else {
-            // Register post-VM1 AP starter; do not dispatch APs before BSP VMLAUNCH
-            // (nested KVM reboot).
+            // Register AP starter for concurrent BSP+AP (or post-VM1 fallback).
             if HYPSTER_SMP {
                 unsafe {
                     hypster_core::ap_trampoline::UEFI_START_AP = Some(start_ap_via_mp_services);
@@ -199,6 +199,20 @@ fn main() -> Status {
 
             static VM2_BINARY: &[u8] =
                 include_bytes!("../../../target/x86_64-unknown-none/release/vm2-app.bin");
+
+            // Calibrate TSC against UEFI Stall (10 ms) before timing trials.
+            {
+                let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+                boot::stall(10_000);
+                let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+                let delta = t1.saturating_sub(t0).max(1);
+                // stall(10_000) = 10_000 µs → Hz = delta * 1e6 / 10000 = delta * 100
+                let hz = delta.saturating_mul(100);
+                throughput::set_tsc_hz(hz);
+                serial_print("[UEFI-LOADER] TSC calibration: 10ms → Hz=");
+                hypster_core::serial::serial_print_dec(hz);
+                serial_print("\n");
+            }
 
             match run_dual_partitions(vm1_slice, vm2_slice, ipc_slice, VM1_BINARY, VM2_BINARY) {
                 Ok(()) => {

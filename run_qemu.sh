@@ -10,26 +10,29 @@ rustup target add x86_64-unknown-none x86_64-unknown-uefi 2>/dev/null || true
 # Guests and UEFI both read TARGET_MODE via option_env! (A = one-shot VM1).
 export TARGET_MODE
 
-# Absolute linker script path — relative -Tlinker.ld breaks when cargo is
-# invoked from the workspace root rather than crates/vm1-app.
-export RUSTFLAGS="-C link-arg=-T${PWD}/crates/vm1-app/linker.ld"
-# Force rebuild when TARGET_MODE flips (option_env! is bake-time).
-touch crates/vm1-app/src/main.rs crates/vm2-app/src/main.rs
-cargo build --target x86_64-unknown-none --release -p vm1-app
-objcopy -O binary target/x86_64-unknown-none/release/vm1-app target/x86_64-unknown-none/release/vm1-app.bin
-
-export RUSTFLAGS="-C link-arg=-T${PWD}/crates/vm1-app/linker.ld"
-cargo build --target x86_64-unknown-none --release -p vm2-app
-objcopy -O binary target/x86_64-unknown-none/release/vm2-app target/x86_64-unknown-none/release/vm2-app.bin
-
-unset RUSTFLAGS
-
 # Phase 2: compile-time gate for AP trampoline (build.rs emits cfg hypster_smp).
+# Export before guest builds so apps can skip chatty putchar under concurrent SMP.
 if [ "$SMP" -ge 2 ]; then
   export HYPSTER_SMP=1
 else
   unset HYPSTER_SMP
 fi
+
+# Absolute linker script path — relative -Tlinker.ld breaks when cargo is
+# invoked from the workspace root rather than crates/vm1-app.
+# static relocation: guests are objcopy'd to flat .bin with no relocator; PIE/GOT
+# indirect calls (e.g. memcpy) jump through unreloctated entries → guest triple fault.
+export RUSTFLAGS="-C link-arg=-T${PWD}/crates/vm1-app/linker.ld -C relocation-model=static"
+# Force rebuild when TARGET_MODE / HYPSTER_SMP flips (option_env! is bake-time).
+touch crates/vm1-app/src/main.rs crates/vm2-app/src/main.rs
+cargo build --target x86_64-unknown-none --release -p vm1-app
+objcopy -O binary target/x86_64-unknown-none/release/vm1-app target/x86_64-unknown-none/release/vm1-app.bin
+
+export RUSTFLAGS="-C link-arg=-T${PWD}/crates/vm1-app/linker.ld -C relocation-model=static"
+cargo build --target x86_64-unknown-none --release -p vm2-app
+objcopy -O binary target/x86_64-unknown-none/release/vm2-app target/x86_64-unknown-none/release/vm2-app.bin
+
+unset RUSTFLAGS
 
 # include_bytes! embeds guest bins at UEFI compile time — force rebuild when bins change.
 # Also touch so option_env!("HYPSTER_SMP") is re-evaluated after SMP toggles.
@@ -65,6 +68,12 @@ fi
 
 # Optional VT-d exercise: add -device intel-iommu,intremap=on
 
+MONITOR_ARGS=(-monitor none)
+if [ -n "${MONITOR_PORT:-}" ]; then
+  MONITOR_ARGS=(-monitor "telnet:127.0.0.1:${MONITOR_PORT},server,nowait")
+  echo "QEMU monitor on telnet://127.0.0.1:${MONITOR_PORT}"
+fi
+
 qemu-system-x86_64 \
   "${KVM_ARGS[@]}" \
   -m 512M \
@@ -74,5 +83,5 @@ qemu-system-x86_64 \
   -drive file=esp.img,format=raw \
   -display none \
   -serial stdio \
-  -monitor none \
+  "${MONITOR_ARGS[@]}" \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04

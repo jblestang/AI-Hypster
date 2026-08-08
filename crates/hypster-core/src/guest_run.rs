@@ -4,8 +4,8 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::guest_boot::{GUEST_CR3_GPA, GUEST_ENTRY_GPA, GUEST_STACK_TOP_GPA};
-use crate::serial::{serial_print, serial_print_hex, serial_putchar};
-use crate::vmexit::{HYPERCALL_GUEST_PUTCHAR, HYPERCALL_GUEST_SHUTDOWN};
+use crate::serial::{serial_print, serial_print_hex};
+use crate::vmexit::{HYPERCALL_GET_PAYLOAD_LEN, HYPERCALL_GUEST_PUTCHAR, HYPERCALL_GUEST_SHUTDOWN};
 
 pub use crate::vmx::VCpu;
 pub use crate::vmx::enable_hardware_vmx;
@@ -16,14 +16,66 @@ use crate::vmx::{
     VMCS_EXIT_QUALIFICATION,
 };
 
-static mut ACTIVE_VCPU: *mut VCpu = core::ptr::null_mut();
-/// Exposed for dual-partition shutdown checks after [`enter_guest`].
+static mut ACTIVE_VCPU: [*mut VCpu; 2] = [core::ptr::null_mut(); 2];
+/// Per-pCPU shutdown flags (index = [`crate::ap_trampoline::current_pcpu`]).
+static GUEST_STOP: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+/// Legacy alias: BSP stop flag (Target A / single-guest paths).
 pub static GUEST_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-static mut ENTRY_FAILED: u64 = 0;
-static mut SAVED_GUEST_RAX: u64 = 0;
-static mut SAVED_GUEST_RCX: u64 = 0;
-static CPUID_PATCH_PENDING: AtomicBool = AtomicBool::new(false);
-static mut CPUID_GPR: [u64; 4] = [0; 4]; // rax, rbx, rcx, rdx
+static mut ENTRY_FAILED: [u64; 2] = [0; 2];
+static mut SAVED_GUEST_RAX: [u64; 2] = [0; 2];
+static mut SAVED_GUEST_RCX: [u64; 2] = [0; 2];
+static CPUID_PATCH_PENDING: [AtomicBool; 2] =
+    [AtomicBool::new(false), AtomicBool::new(false)];
+static mut CPUID_GPR: [[u64; 4]; 2] = [[0; 4]; 2];
+static RAX_PATCH_PENDING: [AtomicBool; 2] =
+    [AtomicBool::new(false), AtomicBool::new(false)];
+static mut RAX_PATCH_VALUE: [u64; 2] = [0; 2];
+/// Payload length for the current Target B trial (returned by GET_PAYLOAD_LEN).
+static mut TRIAL_PAYLOAD_LEN: u64 = 64;
+/// When set, HLT exits VMRESUME immediately (true concurrent BSP+AP; no time slice).
+static CONCURRENT_MODE: AtomicBool = AtomicBool::new(false);
+/// First BSP VM-exit sets `AP_BSP_WAITING` so the parked AP may VMLAUNCH.
+static RELEASE_AP_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_concurrent_mode(on: bool) {
+    CONCURRENT_MODE.store(on, Ordering::SeqCst);
+    crate::serial::set_pcpu_line_tags(on);
+    if !on {
+        RELEASE_AP_ON_EXIT.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn arm_concurrent_ap_release() {
+    RELEASE_AP_ON_EXIT.store(true, Ordering::SeqCst);
+}
+
+pub fn guest_stop_requested(pcpu: usize) -> bool {
+    let i = pcpu.min(1);
+    GUEST_STOP[i].load(Ordering::SeqCst)
+        || (i == 0 && GUEST_STOP_REQUESTED.load(Ordering::SeqCst))
+}
+
+fn clear_guest_stop(pcpu: usize) {
+    let i = pcpu.min(1);
+    GUEST_STOP[i].store(false, Ordering::SeqCst);
+    if i == 0 {
+        GUEST_STOP_REQUESTED.store(false, Ordering::SeqCst);
+    }
+}
+
+fn set_guest_stop(pcpu: usize) {
+    let i = pcpu.min(1);
+    GUEST_STOP[i].store(true, Ordering::SeqCst);
+    if i == 0 {
+        GUEST_STOP_REQUESTED.store(true, Ordering::SeqCst);
+    }
+}
+
+pub fn set_trial_payload_len(len: u64) {
+    unsafe {
+        TRIAL_PAYLOAD_LEN = len.max(1).min(1518);
+    }
+}
 
 /// Host GPRs/RSP saved before VMLAUNCH/VMRESUME. VM-exit leaves guest values in
 /// GPRs and switches to the exit stack; HLT/shutdown yield must restore these
@@ -39,19 +91,30 @@ struct HostYieldSave {
     r15: u64,
 }
 
-static mut HOST_YIELD_SAVE: HostYieldSave = HostYieldSave {
-    rsp: 0,
-    rbp: 0,
-    rbx: 0,
-    r12: 0,
-    r13: 0,
-    r14: 0,
-    r15: 0,
-};
+static mut HOST_YIELD_SAVE: [HostYieldSave; 2] = [
+    HostYieldSave {
+        rsp: 0,
+        rbp: 0,
+        rbx: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+    },
+    HostYieldSave {
+        rsp: 0,
+        rbp: 0,
+        rbx: 0,
+        r12: 0,
+        r13: 0,
+        r14: 0,
+        r15: 0,
+    },
+];
 
 /// 8 KiB exit stack: HOST_RSP at the top. After VM-exit `ret`, RSP lands at
 /// `base+8192` and subsequent host frames grow downward through this buffer
-/// (avoids clobbering BSS neighbors — see Task 10).
+/// (avoids clobbering BSS neighbors — see Task 10). AP uses `AP_HOST_STACKS`.
 #[repr(C, align(16))]
 struct HostExitStack([u8; 8192]);
 
@@ -60,8 +123,7 @@ static mut HOST_EXIT_STACK: HostExitStack = HostExitStack([0; 8192]);
 core::arch::global_asm!(
     ".global vmx_exit_handler",
     "vmx_exit_handler:",
-    "mov [{rax_slot}], rax",
-    "mov [{rcx_slot}], rcx",
+    // Stack guest GPRs immediately — no CALL before this (preserves all GPRs).
     "push r15",
     "push r14",
     "push r13",
@@ -77,8 +139,14 @@ core::arch::global_asm!(
     "push rdx",
     "push rcx",
     "push rax",
-    "mov rdi, [{rax_slot}]",
-    "mov rsi, [{rcx_slot}]",
+    // Handler args from stacked GPRs: rdi=rax, rsi=rcx, rdx=gpr_stack.
+    // Also mirror into per-pCPU save for any auxiliary readers.
+    "mov rdi, qword ptr [rsp]",
+    "mov rsi, qword ptr [rsp + 8]",
+    "call save_guest_gprs_for_pcpu",
+    "mov rdi, qword ptr [rsp]",
+    "mov rsi, qword ptr [rsp + 8]",
+    "mov rdx, rsp",
     "mov rcx, rsp",
     "and rsp, -16",
     "sub rsp, 8",
@@ -109,19 +177,19 @@ core::arch::global_asm!(
     "pop r15",
     "vmresume",
     "ud2",
-    // Yield/shutdown: discard guest GPRs, restore host callee-saved + Rust RSP,
-    // then jump to the enter continuation (do not `ret` on the exit stack).
+    // Yield/shutdown: discard guest GPRs, restore host callee-saved + Rust RSP.
     "1:",
     "add rsp, 15*8",
-    "mov rax, qword ptr [rsp]",
-    "mov rsp, qword ptr [{ysave}]",
-    "mov rbp, qword ptr [{ysave} + 8]",
-    "mov rbx, qword ptr [{ysave} + 16]",
-    "mov r12, qword ptr [{ysave} + 24]",
-    "mov r13, qword ptr [{ysave} + 32]",
-    "mov r14, qword ptr [{ysave} + 40]",
-    "mov r15, qword ptr [{ysave} + 48]",
-    "jmp rax",
+    "mov r11, qword ptr [rsp]",
+    "call host_yield_save_ptr",
+    "mov rsp, qword ptr [rax]",
+    "mov rbp, qword ptr [rax + 8]",
+    "mov rbx, qword ptr [rax + 16]",
+    "mov r12, qword ptr [rax + 24]",
+    "mov r13, qword ptr [rax + 32]",
+    "mov r14, qword ptr [rax + 40]",
+    "mov r15, qword ptr [rax + 48]",
+    "jmp r11",
     ".global vmx_do_launch",
     "vmx_do_launch:",
     "vmlaunch",
@@ -130,9 +198,6 @@ core::arch::global_asm!(
     "vmx_do_resume:",
     "vmresume",
     "ret",
-    rax_slot = sym SAVED_GUEST_RAX,
-    rcx_slot = sym SAVED_GUEST_RCX,
-    ysave = sym HOST_YIELD_SAVE,
 );
 
 extern "C" {
@@ -141,26 +206,57 @@ extern "C" {
     fn vmx_do_resume();
 }
 
+#[no_mangle]
+extern "C" fn save_guest_gprs_for_pcpu(rax: u64, rcx: u64) {
+    let i = crate::ap_trampoline::current_pcpu().min(1);
+    unsafe {
+        SAVED_GUEST_RAX[i] = rax;
+        SAVED_GUEST_RCX[i] = rcx;
+    }
+}
+
+/// Returns guest rax in RAX and guest rcx in RDX (SysV u128).
+#[no_mangle]
+extern "C" fn load_guest_rax_rcx_for_pcpu() -> u128 {
+    let i = crate::ap_trampoline::current_pcpu().min(1);
+    unsafe {
+        let a = SAVED_GUEST_RAX[i];
+        let c = SAVED_GUEST_RCX[i];
+        (c as u128) << 64 | (a as u128)
+    }
+}
+
+/// Returns pointer to this pCPU's [`HostYieldSave`] in RAX for the exit stub.
+#[no_mangle]
+extern "C" fn host_yield_save_ptr() -> *mut HostYieldSave {
+    let i = crate::ap_trampoline::current_pcpu().min(1);
+    unsafe { core::ptr::addr_of_mut!(HOST_YIELD_SAVE[i]) }
+}
+
 /// VM-exit loads host RSP from VMCS_HOST_RSP. The exit stub pushes 15 GPRs then
 /// `ret`s to the continuation — RSP must equal the slot holding that address.
 pub fn host_exit_rsp_anchor(pcpu_id: usize) -> u64 {
-    let _ = pcpu_id;
+    if pcpu_id != 0 {
+        let a = crate::ap_trampoline::ap_exit_anchor();
+        if a != 0 {
+            return a;
+        }
+    }
     // SAFETY: BSP exit stack; HOST_RSP at top so post-exit frames grow into the 8 KiB.
     unsafe { core::ptr::addr_of_mut!(HOST_EXIT_STACK) as u64 + 8192 - 8 }
 }
 
 pub fn set_host_exit_pcpu(pcpu_id: usize) {
-    let _ = pcpu_id;
+    crate::ap_trampoline::set_host_exit_pcpu(pcpu_id);
 }
 
 pub fn install_ap_exit_stack(_page_hpa: u64) {}
-
 
 #[no_mangle]
 extern "C" fn vmwrite_host_rsp(rsp: u64) {
     unsafe {
         let mut host_rsp = rsp;
-        if crate::ap_trampoline::host_exit_pcpu() != 0 {
+        if crate::ap_trampoline::current_pcpu() != 0 {
             let a = crate::ap_trampoline::ap_exit_anchor();
             if a != 0 {
                 let cont = core::ptr::read_volatile(rsp as *const u64);
@@ -175,24 +271,30 @@ extern "C" fn vmwrite_host_rsp(rsp: u64) {
 
 #[no_mangle]
 extern "C" fn apply_cpuid_patch(gpr_stack: *mut u64) {
-    if !CPUID_PATCH_PENDING.load(Ordering::Acquire) {
-        return;
+    let i = crate::ap_trampoline::current_pcpu().min(1);
+    if CPUID_PATCH_PENDING[i].load(Ordering::Acquire) {
+        CPUID_PATCH_PENDING[i].store(false, Ordering::Release);
+        unsafe {
+            *gpr_stack.add(0) = CPUID_GPR[i][0];
+            *gpr_stack.add(1) = CPUID_GPR[i][2];
+            *gpr_stack.add(2) = CPUID_GPR[i][3];
+            *gpr_stack.add(3) = CPUID_GPR[i][1];
+        }
     }
-    CPUID_PATCH_PENDING.store(false, Ordering::Release);
-    unsafe {
-        // Stack layout (top first): rax, rcx, rdx, rbx, ...
-        *gpr_stack.add(0) = CPUID_GPR[0];
-        *gpr_stack.add(1) = CPUID_GPR[2];
-        *gpr_stack.add(2) = CPUID_GPR[3];
-        *gpr_stack.add(3) = CPUID_GPR[1];
+    if RAX_PATCH_PENDING[i].load(Ordering::Acquire) {
+        RAX_PATCH_PENDING[i].store(false, Ordering::Release);
+        unsafe {
+            *gpr_stack.add(0) = RAX_PATCH_VALUE[i];
+        }
     }
 }
 
 #[no_mangle]
 extern "C" fn reload_host_rsp() {
     unsafe {
-        let mut host_rsp = host_exit_rsp_anchor(0);
-        if crate::ap_trampoline::host_exit_pcpu() != 0 {
+        let pcpu = crate::ap_trampoline::current_pcpu();
+        let mut host_rsp = host_exit_rsp_anchor(pcpu);
+        if pcpu != 0 {
             let a = crate::ap_trampoline::ap_exit_anchor();
             if a != 0 {
                 host_rsp = a;
@@ -203,19 +305,41 @@ extern "C" fn reload_host_rsp() {
 }
 
 #[no_mangle]
-extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64) -> u8 {
+extern "C" fn vmx_handle_exit(guest_rax_arg: u64, guest_rcx_arg: u64, _gpr_stack: u64) -> u8 {
     unsafe {
-        if ACTIVE_VCPU.is_null() {
+        let pcpu = crate::ap_trampoline::current_pcpu().min(1);
+        let active = ACTIVE_VCPU[pcpu];
+        if active.is_null() {
             return 0;
         }
 
-        let vcpu = &mut *ACTIVE_VCPU;
+        let vcpu = &mut *active;
         vcpu.launched = true;
 
-        // Under nested KVM, host RAX at VM-exit may not hold the guest value;
-        // the exit stub saves them before any host clobber.
-        let guest_rax = SAVED_GUEST_RAX;
-        let guest_rcx = SAVED_GUEST_RCX;
+        // Release parked AP once BSP has entered guest (first exit on pCPU 0).
+        if pcpu == 0
+            && RELEASE_AP_ON_EXIT.swap(false, Ordering::SeqCst)
+        {
+            crate::ap_trampoline::AP_BSP_WAITING.store(true, Ordering::SeqCst);
+            serial_print("[HYPSTER] concurrent: AP released on first BSP VM-exit\n");
+        }
+
+        // Args from exit stub (stacked GPRs). Also refresh per-pCPU save for
+        // any code that still reads SAVED_* after this returns.
+        let mut guest_rax = guest_rax_arg;
+        let mut guest_rcx = guest_rcx_arg;
+        SAVED_GUEST_RAX[pcpu] = guest_rax;
+        SAVED_GUEST_RCX[pcpu] = guest_rcx;
+
+        // Nested KVM under dual-VMLAUNCH has shown RAX/RCX swapped on VMCALL;
+        // accept either orientation for putchar.
+        if guest_rcx == HYPERCALL_GUEST_PUTCHAR
+            && guest_rax != HYPERCALL_GUEST_PUTCHAR
+            && guest_rax != HYPERCALL_GUEST_SHUTDOWN
+            && guest_rax != HYPERCALL_GET_PAYLOAD_LEN
+        {
+            core::mem::swap(&mut guest_rax, &mut guest_rcx);
+        }
 
         let exit_reason_full = vmread(VMCS_VM_EXIT_REASON);
         let exit_reason = exit_reason_full as u32 & 0xFFFF;
@@ -225,10 +349,17 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
         let resume = if exit_reason == 18 {
             // VMCALL
             match guest_rax {
-                HYPERCALL_GUEST_PUTCHAR => serial_putchar(guest_rcx as u8),
+                HYPERCALL_GUEST_PUTCHAR => {
+                    let vm = (*active).vm_id.min(9) as u8;
+                    crate::serial::guest_putchar_line(vm, guest_rcx as u8);
+                }
+                HYPERCALL_GET_PAYLOAD_LEN => {
+                    RAX_PATCH_VALUE[pcpu] = TRIAL_PAYLOAD_LEN;
+                    RAX_PATCH_PENDING[pcpu].store(true, Ordering::Release);
+                }
                 HYPERCALL_GUEST_SHUTDOWN => {
-                    GUEST_STOP_REQUESTED.store(true, Ordering::SeqCst);
-                    ENTRY_FAILED = 0;
+                    set_guest_stop(pcpu);
+                    ENTRY_FAILED[pcpu] = 0;
                     vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
                     serial_print("[HYPSTER] Guest shutdown acknowledged\n");
                     // On AP, bypass exit-stub `ret` (continuation slot is fragile).
@@ -238,23 +369,45 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
                     return 0;
                 }
                 other => {
-                    serial_print("[HYPSTER] Unknown guest hypercall ");
-                    serial_print_hex(other);
-                    serial_print("\n");
+                    // Rate-limit: concurrent dual-VMLAUNCH used to flood the UART
+                    // with interleaved Unknown lines that were impossible to read.
+                    static UNKNOWN_LEFT: [core::sync::atomic::AtomicU32; 2] = [
+                        core::sync::atomic::AtomicU32::new(8),
+                        core::sync::atomic::AtomicU32::new(8),
+                    ];
+                    let left = UNKNOWN_LEFT[pcpu].load(Ordering::Relaxed);
+                    if left > 0 {
+                        UNKNOWN_LEFT[pcpu].store(left - 1, Ordering::Relaxed);
+                        crate::serial::serial_with_lock(|| {
+                            serial_print("[HYPSTER] Unknown guest hypercall rax=");
+                            serial_print_hex(other);
+                            serial_print(" rcx=");
+                            serial_print_hex(guest_rcx);
+                            serial_print(" pcpu=");
+                            crate::serial::serial_print_dec(pcpu as u64);
+                            serial_print(" rip=");
+                            serial_print_hex(guest_rip);
+                            serial_print("\n");
+                        });
+                    }
                 }
             }
             vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
             true
         } else if exit_reason == 12 {
-            // HLT — yield to host scheduler (return 0); shutdown uses VMCALL path.
-            ENTRY_FAILED = 0;
+            // HLT — time-slice yield unless concurrent mode (VMRESUME immediately).
             vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
-            return 0;
+            if CONCURRENT_MODE.load(Ordering::Relaxed) {
+                true
+            } else {
+                ENTRY_FAILED[pcpu] = 0;
+                return 0;
+            }
         } else if exit_reason == 10 {
             // CPUID — patch guest GPR stack slots before vmresume (see apply_cpuid_patch).
             let (eax, ebx, ecx, edx) = emulate_cpuid(guest_rax, guest_rcx);
-            CPUID_GPR = [eax as u64, ebx as u64, ecx as u64, edx as u64];
-            CPUID_PATCH_PENDING.store(true, Ordering::Release);
+            CPUID_GPR[pcpu] = [eax as u64, ebx as u64, ecx as u64, edx as u64];
+            CPUID_PATCH_PENDING[pcpu].store(true, Ordering::Release);
             vmwrite(VMCS_GUEST_RIP, guest_rip + inst_len);
             true
         } else if exit_reason == 2 {
@@ -286,7 +439,7 @@ extern "C" fn vmx_handle_exit(_guest_rax: u64, _guest_rcx: u64, _guest_rdx: u64)
         };
 
         if !resume {
-            ENTRY_FAILED = 0;
+            ENTRY_FAILED[pcpu] = 0;
         }
         if resume { 1 } else { 0 }
     }
@@ -308,12 +461,15 @@ unsafe fn emulate_cpuid(leaf: u64, _subleaf: u64) -> (u32, u32, u32, u32) {
 }
 
 unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64> {
-    ACTIVE_VCPU = vcpu as *mut VCpu;
+    let pcpu = crate::ap_trampoline::current_pcpu().min(1);
+    ACTIVE_VCPU[pcpu] = vcpu as *mut VCpu;
     vmwrite(VMCS_HOST_RIP, vmx_exit_handler as *const () as u64);
 
-    let anchor = host_exit_rsp_anchor(0);
+    let anchor = host_exit_rsp_anchor(pcpu);
+    let ysave = core::ptr::addr_of_mut!(HOST_YIELD_SAVE[pcpu]);
+    let fail_slot = core::ptr::addr_of_mut!(ENTRY_FAILED[pcpu]);
     let continuation: u64;
-    ENTRY_FAILED = 0xFFFF_FFFF_FFFF_FFFF;
+    ENTRY_FAILED[pcpu] = 0xFFFF_FFFF_FFFF_FFFF;
 
     if use_launch {
         asm!(
@@ -336,10 +492,8 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
             "3:",
             anchor = in(reg) anchor,
             cont = out(reg) continuation,
-            fail_slot = sym ENTRY_FAILED,
-            ysave = sym HOST_YIELD_SAVE,
-            // VM-exit leaves guest values in caller-saved GPRs; yield restores
-            // only callee-saved + RSP. Tell rustc the volatiles are gone.
+            fail_slot = in(reg) fail_slot,
+            ysave = in(reg) ysave,
             out("rax") _,
             out("rcx") _,
             out("rdx") _,
@@ -371,8 +525,8 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
             "3:",
             anchor = in(reg) anchor,
             cont = out(reg) continuation,
-            fail_slot = sym ENTRY_FAILED,
-            ysave = sym HOST_YIELD_SAVE,
+            fail_slot = in(reg) fail_slot,
+            ysave = in(reg) ysave,
             out("rax") _,
             out("rcx") _,
             out("rdx") _,
@@ -385,7 +539,7 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
         );
     }
 
-    if ENTRY_FAILED != 0 {
+    if ENTRY_FAILED[pcpu] != 0 {
         return Err(vmread(VMCS_VM_INSTRUCTION_ERROR));
     }
     Ok(())
@@ -394,7 +548,8 @@ unsafe fn enter_guest_inner(vcpu: &mut VCpu, use_launch: bool) -> Result<(), u64
 /// Run one vCPU time slice: enter guest until HLT yield, shutdown VMCALL, or fatal exit.
 /// Returns `Ok(true)` if guest is still runnable, `Ok(false)` on shutdown, `Err` on VM-entry fail.
 pub unsafe fn run_vcpu_once(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<bool, u64> {
-    GUEST_STOP_REQUESTED.store(false, Ordering::SeqCst);
+    let pcpu = crate::ap_trampoline::current_pcpu().min(1);
+    clear_guest_stop(pcpu);
 
     vmptrld_vmcs(vcpu);
 
@@ -407,7 +562,7 @@ pub unsafe fn run_vcpu_once(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<bool, u
     let use_launch = !vcpu.launched;
     enter_guest_inner(vcpu, use_launch)?;
 
-    if GUEST_STOP_REQUESTED.load(Ordering::SeqCst) {
+    if guest_stop_requested(pcpu) {
         Ok(false)
     } else {
         Ok(true)
@@ -416,7 +571,8 @@ pub unsafe fn run_vcpu_once(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<bool, u
 
 /// Configure VMCS and enter guest mode until shutdown or failure.
 pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64> {
-    GUEST_STOP_REQUESTED.store(false, Ordering::SeqCst);
+    let pcpu = crate::ap_trampoline::current_pcpu().min(1);
+    clear_guest_stop(pcpu);
 
     vcpu.registers.rip = GUEST_ENTRY_GPA;
     vcpu.registers.rsp = GUEST_STACK_TOP_GPA;
@@ -424,12 +580,14 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
 
     vmptrld_vmcs(vcpu);
     setup_hardware_vmcs(vcpu, ept_pml4_pa, GUEST_CR3_GPA);
-    ACTIVE_VCPU = vcpu as *mut VCpu;
+    ACTIVE_VCPU[pcpu] = vcpu as *mut VCpu;
     vmwrite(VMCS_HOST_RIP, vmx_exit_handler as *const () as u64);
 
-    let anchor = host_exit_rsp_anchor(0);
+    let anchor = host_exit_rsp_anchor(pcpu);
+    let ysave = core::ptr::addr_of_mut!(HOST_YIELD_SAVE[pcpu]);
+    let fail_slot = core::ptr::addr_of_mut!(ENTRY_FAILED[pcpu]);
     let continuation: u64;
-    ENTRY_FAILED = 0xFFFF_FFFF_FFFF_FFFF;
+    ENTRY_FAILED[pcpu] = 0xFFFF_FFFF_FFFF_FFFF;
 
     asm!(
         "mov qword ptr [{ysave}], rsp",
@@ -451,8 +609,8 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
         "3:",
         anchor = in(reg) anchor,
         cont = out(reg) continuation,
-        fail_slot = sym ENTRY_FAILED,
-        ysave = sym HOST_YIELD_SAVE,
+        fail_slot = in(reg) fail_slot,
+        ysave = in(reg) ysave,
         out("rax") _,
         out("rcx") _,
         out("rdx") _,
@@ -464,8 +622,8 @@ pub unsafe fn enter_guest(vcpu: &mut VCpu, ept_pml4_pa: u64) -> Result<u64, u64>
         out("r11") _,
     );
 
-    let launch_failed = ENTRY_FAILED;
-    if GUEST_STOP_REQUESTED.load(Ordering::SeqCst) || launch_failed == 0 {
+    let launch_failed = ENTRY_FAILED[pcpu];
+    if guest_stop_requested(pcpu) || launch_failed == 0 {
         serial_print("[HYPSTER] enter_guest returned from VM-exit loop\n");
         return Ok(1);
     }
@@ -511,7 +669,7 @@ pub fn run_single_guest(
     unsafe {
         match enter_guest(vcpu, ept_pml4_pa) {
             Ok(_) => {
-                if GUEST_STOP_REQUESTED.load(Ordering::SeqCst) {
+                if guest_stop_requested(0) {
                     serial_print("[HYPSTER] Guest exited cleanly.\n");
                     Ok(())
                 } else {

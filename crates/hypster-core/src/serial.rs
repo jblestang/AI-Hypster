@@ -1,142 +1,213 @@
-//! ## ISO 26262 ASIL-D & ANSSI CESTI High-Assurance Compliance
-//! - **Non-Interference**: Proven spatial, temporal, and information flow non-interference.
-//! - **Fault Isolation**: Traps hardware ECC DRAM errors and guest triple faults cleanly.
-//! - **Zero VM-Exit MMIO**: Direct EPT passthrough for assigned physical device BAR registers.
+//! IBM PC 16550 UART serial diagnostic driver (`serial.rs`).
 //!
-//! ## Common Criteria EAL5+ Security Functional Requirements (SFRs)
-//! - **FDP_ACC.2/SK**: Complete Access Control over physical CPU cores, DRAM ranges, and MMIO.
-//! - **FDP_ACF.1/SK**: Security Attribute Based Access Control enforcing 4-level EPT page table bounds.
-//! - **FPT_SEP.1/TSF**: TSF Domain Separation protecting hypervisor memory from untrusted guest partitions.
-//! - **FPT_FLS.1/TSF**: Preservation of Secure State upon guest triple fault or ECC DRAM Machine Check.
-//! - **FPT_RCV.1/TSF**: Automatic Partition Recovery resetting vCPU registers without affecting peer partitions.
-//! - **FRU_RSA.1/CAT**: Real-Time Resource Allocation & Intel CAT L3 cache partitioning.
-//!
-//! # IBM PC 16550 UART Serial Diagnostic Driver (`serial.rs`)
-//!
-//! Provides bare-metal `#![no_std]` serial output over IBM PC COM1 (`0x3F8`) for hypervisor
-//! diagnostic logging and ANSSI Common Criteria security audit tracing.
-//!
-//! ## Architectural References & Checklist Compliance
-//! - **Section 3.1 ("Diagnostic Logging")**: 115200 8N1 baud rate hardware initialization,
-//!   Divisor Latch Access Bit (DLAB) programming, FIFO trigger setup, and thread-safe serial writes.
+//! Under SMP / concurrent BSP+AP:
+//! - **Line-scoped lock**: a core keeps the UART until it emits `\\n`, so
+//!   `serial_print` + `serial_print_hex` + `\\n` cannot be split mid-message.
+//! - **`[Cn]` tags** (optional): each new host line is prefixed with the pCPU id.
+
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use x86_64::instructions::port::Port;
+
 use crate::config::{
-    UART16550_COM1_PORT,
-    UART16550_BAUD_115200_DLL,
-    UART16550_BAUD_115200_DLM,
-    UART16550_LCR_8N1,
-    UART16550_FCR_ENABLE_FIFO,
+    UART16550_BAUD_115200_DLL, UART16550_BAUD_115200_DLM, UART16550_COM1_PORT,
+    UART16550_FCR_ENABLE_FIFO, UART16550_LCR_8N1,
 };
 
-/// Initialize 16550 UART Hardware Controller for 115200 Baud 8N1 Operation
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
-pub fn init_serial() {
+static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
+static SERIAL_OWNER: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// When set, host lines are prefixed `[C0]` / `[C1]`.
+static TAG_PCPU: AtomicBool = AtomicBool::new(false);
+static AT_LINE_START: AtomicBool = AtomicBool::new(true);
+/// Guest putchar line buffers (one per pCPU).
+static mut GUEST_LINE: [[u8; 160]; 2] = [[0; 160]; 2];
+static GUEST_LINE_LEN: [AtomicU8; 2] = [AtomicU8::new(0), AtomicU8::new(0)];
+
+fn pcpu_id() -> usize {
+    crate::ap_trampoline::current_pcpu().min(1)
+}
+
+/// Acquire UART ownership for this pCPU (no-op if already owned by us).
+fn acquire_line() {
     if cfg!(test) {
-        // Verify security policy condition bounds
         return;
     }
-    // SAFETY: Port I/O writes to hardware COM1 registers are safe during UEFI cold boot.
+    let me = pcpu_id();
+    if SERIAL_OWNER.load(Ordering::Relaxed) == me {
+        return;
+    }
+    while SERIAL_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    SERIAL_OWNER.store(me, Ordering::Relaxed);
+}
+
+/// Release UART ownership (end of line).
+fn release_line() {
+    if cfg!(test) {
+        return;
+    }
+    SERIAL_OWNER.store(usize::MAX, Ordering::Relaxed);
+    SERIAL_LOCK.store(false, Ordering::Release);
+    AT_LINE_START.store(true, Ordering::Relaxed);
+}
+
+fn putchar_raw(c: u8) {
+    if cfg!(test) {
+        return;
+    }
     unsafe {
-        // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
+        let mut data = Port::<u8>::new(UART16550_COM1_PORT);
+        data.write(c);
+    }
+}
+
+fn write_host_byte(b: u8) {
+    acquire_line();
+    let tag = TAG_PCPU.load(Ordering::Relaxed);
+    if tag && AT_LINE_START.load(Ordering::Relaxed) && b != b'\n' && b != b'\r' {
+        putchar_raw(b'[');
+        putchar_raw(b'C');
+        putchar_raw(b'0' + pcpu_id() as u8);
+        putchar_raw(b']');
+        putchar_raw(b' ');
+        AT_LINE_START.store(false, Ordering::Relaxed);
+    }
+    if b == b'\n' {
+        putchar_raw(b'\r');
+        putchar_raw(b'\n');
+        release_line();
+    } else if b == b'\r' {
+        // ignore; newline emits CRLF
+    } else {
+        putchar_raw(b);
+        AT_LINE_START.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Hold the line lock across a closure (still releases on embedded newlines).
+pub fn serial_with_lock(f: impl FnOnce()) {
+    acquire_line();
+    f();
+    // If caller forgot a trailing newline, flush ownership so we cannot deadlock.
+    if SERIAL_OWNER.load(Ordering::Relaxed) == pcpu_id() {
+        release_line();
+    }
+}
+
+pub fn set_pcpu_line_tags(on: bool) {
+    TAG_PCPU.store(on, Ordering::SeqCst);
+}
+
+pub fn init_serial() {
+    if cfg!(test) {
+        return;
+    }
+    unsafe {
         let mut ier = Port::<u8>::new(UART16550_COM1_PORT + 1);
         let mut fcr = Port::<u8>::new(UART16550_COM1_PORT + 2);
         let mut lcr = Port::<u8>::new(UART16550_COM1_PORT + 3);
         let mut dll = Port::<u8>::new(UART16550_COM1_PORT);
         let mut dlm = Port::<u8>::new(UART16550_COM1_PORT + 1);
 
-        // Step 1: Disable UART interrupts during initialization
         ier.write(0x00);
-        // Step 2: Enable DLAB (Divisor Latch Access Bit, bit 7 of LCR)
         lcr.write(0x80);
-        // Step 3: Set Baud Rate Divisor LSB = 1 (115200 Baud)
         dll.write(UART16550_BAUD_115200_DLL);
-        // Step 4: Set Baud Rate Divisor MSB = 0
         dlm.write(UART16550_BAUD_115200_DLM);
-        // Step 5: Program 8 data bits, no parity, 1 stop bit (8N1) & disable DLAB
         lcr.write(UART16550_LCR_8N1);
-        // Step 6: Enable FIFO, clear 14-byte threshold queues
         fcr.write(UART16550_FCR_ENABLE_FIFO);
     }
 }
 
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
 pub fn poll_com2_host_packet(_buffer: &mut [u8]) -> usize {
     0
 }
 
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
 pub fn serial_putchar(c: u8) {
-    if cfg!(test) {
-        // Verify security policy condition bounds
-        return;
-    }
-    unsafe {
-        // SAFETY: Low-level hardware register interaction verified against EAL5+ non-interference model
-        let mut data = Port::<u8>::new(UART16550_COM1_PORT);
-        data.write(c);
-    }
+    write_host_byte(c);
 }
 
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
 pub fn serial_print(s: &str) {
     for b in s.bytes() {
-        // Iterate through statically allocated TSF entries
-        if b == b'\n' {
-        // Verify security policy condition bounds
-            serial_putchar(b'\r');
-        }
-        serial_putchar(b);
+        write_host_byte(b);
     }
 }
 
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
 pub fn serial_print_hex(val: u64) {
-    serial_print("0x");
+    write_host_byte(b'0');
+    write_host_byte(b'x');
     for shift in (0..16).rev() {
-        // Iterate through statically allocated TSF entries
         let nibble = ((val >> (shift * 4)) & 0xF) as u8;
-        let char_byte = if nibble < 10 { b'0' + nibble } else { b'A' + (nibble - 10) };
-        serial_putchar(char_byte);
+        let char_byte = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'A' + (nibble - 10)
+        };
+        write_host_byte(char_byte);
     }
 }
 
-    /// Executable TSF function  enforcing EAL5+ security policy rules.
-    /// Safety: Enforces memory isolation and parameter validation.
-    /// Common Criteria EAL5+ TSF Operational Verification:
-    /// Enforces non-interference invariants, memory range validation, and register safety.
 pub fn serial_print_dec(mut val: u64) {
     if val == 0 {
-        // Verify security policy condition bounds
-        serial_putchar(b'0');
+        write_host_byte(b'0');
         return;
     }
     let mut buf = [0u8; 20];
     let mut i = 0;
-        // Polling loop with bounded execution guarantee
     while val > 0 {
         buf[i] = b'0' + (val % 10) as u8;
         val /= 10;
         i += 1;
     }
-        // Polling loop with bounded execution guarantee
     while i > 0 {
         i -= 1;
-        serial_putchar(buf[i]);
+        write_host_byte(buf[i]);
     }
+}
+
+/// Buffer a guest putchar; on newline emit one locked line tagged `[VMn/Cn]`.
+pub fn guest_putchar_line(vm_id: u8, c: u8) {
+    let cpu = pcpu_id();
+    let len = GUEST_LINE_LEN[cpu].load(Ordering::Relaxed) as usize;
+    if c == b'\n' || len + 1 >= 160 {
+        acquire_line();
+        putchar_raw(b'[');
+        putchar_raw(b'V');
+        putchar_raw(b'M');
+        putchar_raw(b'0' + vm_id.min(9));
+        putchar_raw(b'/');
+        putchar_raw(b'C');
+        putchar_raw(b'0' + cpu as u8);
+        putchar_raw(b']');
+        putchar_raw(b' ');
+        unsafe {
+            for &b in &GUEST_LINE[cpu][..len] {
+                if b == b'\n' {
+                    putchar_raw(b'\r');
+                }
+                putchar_raw(b);
+            }
+        }
+        putchar_raw(b'\r');
+        putchar_raw(b'\n');
+        release_line();
+        GUEST_LINE_LEN[cpu].store(0, Ordering::Relaxed);
+        if c != b'\n' && c != b'\r' {
+            unsafe {
+                GUEST_LINE[cpu][0] = c;
+            }
+            GUEST_LINE_LEN[cpu].store(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    if c == b'\r' {
+        return;
+    }
+    unsafe {
+        GUEST_LINE[cpu][len] = c;
+    }
+    GUEST_LINE_LEN[cpu].store((len + 1) as u8, Ordering::Relaxed);
 }

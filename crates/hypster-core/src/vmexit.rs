@@ -31,6 +31,7 @@ pub const HYPERCALL_FWD_UNIDIR: u64 = 0x105;
 pub const HYPERCALL_XMIT_E1000: u64 = 0x106;
 pub const HYPERCALL_GUEST_PUTCHAR: u64 = 0x200;
 pub const HYPERCALL_GUEST_SHUTDOWN: u64 = 0x201;
+pub const HYPERCALL_GET_PAYLOAD_LEN: u64 = 0x202;
 
 // Hardware Intel VT-x VM Exit Reason Codes
 pub const EXIT_REASON_TRIPLE_FAULT: u64 = 2;
